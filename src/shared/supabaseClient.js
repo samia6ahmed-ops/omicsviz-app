@@ -1,7 +1,10 @@
 import { createClient } from "@supabase/supabase-js";
 
-const url = import.meta.env.VITE_SUPABASE_URL;
-const key = import.meta.env.VITE_SUPABASE_ANON_KEY;
+// Strip stray whitespace/newlines/quotes that often sneak in when pasting
+// values into the Vercel dashboard (they cause "Invalid value" fetch errors).
+const clean = (v) => (v || "").replace(/[\s"'​-‍﻿]/g, "");
+const url = clean(import.meta.env.VITE_SUPABASE_URL);
+const key = clean(import.meta.env.VITE_SUPABASE_ANON_KEY);
 
 // If Supabase hasn't been configured yet (no .env set up), we export null
 // instead of throwing, so the app still runs fully in "no accounts" mode.
