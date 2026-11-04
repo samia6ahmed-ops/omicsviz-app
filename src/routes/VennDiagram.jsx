@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
 import { ThemeCtx as TC, useTheme } from "../shared/theme";
+import CloudProjects from "../shared/CloudProjects";
 
 // ═══════════════════════════════════════════════════════════════════════════════
 //  Omilytix — Venn / UpSet Diagram
@@ -1495,6 +1496,7 @@ export default function VennDiagramPage() {
         <div style={{height:20, width:1, background:C.border}}/>
         <span style={{fontSize:12, fontWeight:600, color:C.muted}}>{active.name}</span>
         <div style={{flex:1}}/>
+        <CloudProjects tool="venn" getData={()=>({version:2,tool:"venn-diagram",sheets})} onLoad={loadProject}/>
         <div style={{display:"flex", background:C.panel2, borderRadius:8, padding:2, border:"1px solid "+C.border}}>
           {[["split","Split"],["data","Sets"],["plot","Plot"]].map(([id,lb])=>(
             <button key={id} onClick={()=>setLayout(id)} style={{padding:"4px 12px", fontSize:11, fontWeight:600, cursor:"pointer", borderRadius:6, border:"none",

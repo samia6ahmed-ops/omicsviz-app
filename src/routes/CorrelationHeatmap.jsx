@@ -1,5 +1,6 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
 import { ThemeCtx, useTheme } from "../shared/theme";
+import CloudProjects from "../shared/CloudProjects";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Omilytix — Correlation Heatmap
@@ -2196,6 +2197,7 @@ export default function CorrelationHeatmapPage() {
           <div style={{height:20,width:1,background:activeTheme.border}}/>
           <span style={{fontSize:12,fontWeight:600,color:activeTheme.muted}}>{activeSheet.name}</span>
           <div style={{flex:1}}/>
+        <CloudProjects tool="correlation" getData={()=>({version:2,tool:"correlation-heatmap",sheets})} onLoad={loadProject}/>
           <div style={{display:"flex",background:activeTheme.panel2,borderRadius:8,padding:2,border:"1px solid "+activeTheme.border}}>
             {[["split","Split"],["data","Data"],["plot","Plot"]].map(([id,lb])=>(
               <button key={id} onClick={()=>setLayout(id)} style={{padding:"4px 12px",fontSize:11,fontWeight:600,cursor:"pointer",borderRadius:6,border:"none",background:layout===id?activeTheme.panel:"transparent",color:layout===id?activeTheme.text:activeTheme.muted,boxShadow:layout===id?activeTheme.shadow:"none"}}>{lb}</button>
