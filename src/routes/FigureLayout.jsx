@@ -1,5 +1,6 @@
 import { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
 import { ThemeCtx, useTheme } from "../shared/theme";
+import { downloadBlob, prepareSVGForExport, serializeSVG, rasterizeSVG, encodeCanvas } from "../shared/exportUtils";
 
 // ════════════════════════════════════════════════════════════════════════════
 // Omilytix — Figure Layout
@@ -364,14 +365,19 @@ function ExportPanel({canvasRef, canvas}) {
   const [dpi,setDpi]=useState(300);
   const [saving,setSaving]=useState(false);
   const [done,setDone]=useState(false);
+  const [err,setErr]=useState("");
 
+  // Uses the shared export plumbing (blob URLs, appended anchors, onerror
+  // fallbacks, real TIFF encoder). The old path handed out base64 data: URLs
+  // via a detached <a> — silent failures on large figures and in Firefox — and
+  // its "TIFF" was a PNG renamed to .tif.
   const runExport = async () => {
-    setSaving(true);
+    setSaving(true); setErr("");
     const name = "figure_"+new Date().toISOString().slice(0,10);
     await new Promise(r=>setTimeout(r,60));
     try {
       const svgEl = canvasRef.current && canvasRef.current.querySelector("svg");
-      if (!svgEl) return;
+      if (!svgEl) { setErr("Couldn't find the canvas to export."); return; }
       const clone = svgEl.cloneNode(true);
       clone.setAttribute("xmlns","http://www.w3.org/2000/svg");
       // strip selection-only UI (handles, guides) from the export clone
@@ -380,30 +386,17 @@ function ExportPanel({canvasRef, canvas}) {
       if (format==="svg") {
         clone.setAttribute("width", canvas.widthMM+"mm");
         clone.setAttribute("height", canvas.heightMM+"mm");
-        const a=document.createElement("a");
-        a.href=URL.createObjectURL(new Blob([clone.outerHTML],{type:"image/svg+xml"}));
-        a.download=name+".svg"; a.click();
+        downloadBlob(new Blob([serializeSVG(clone)],{type:"image/svg+xml;charset=utf-8"}), name+".svg");
       } else {
         const pxW = Math.round(canvas.widthMM/25.4*dpi), pxH = Math.round(canvas.heightMM/25.4*dpi);
-        clone.setAttribute("width", svgWpx); clone.setAttribute("height", svgHpx);
-        const svgStr = new XMLSerializer().serializeToString(clone);
-        const img = new Image();
-        img.onload = () => {
-          const c=document.createElement("canvas"); c.width=pxW; c.height=pxH;
-          const ctx=c.getContext("2d"); ctx.scale(pxW/svgWpx, pxH/svgHpx);
-          ctx.fillStyle=canvas.bg||"#fff"; ctx.fillRect(0,0,svgWpx,svgHpx);
-          ctx.drawImage(img,0,0);
-          const suffix="_"+dpi+"dpi";
-          const a=document.createElement("a");
-          if (format==="jpeg") { a.href=c.toDataURL("image/jpeg",0.95); a.download=name+suffix+".jpg"; }
-          else if (format==="tiff") { a.href=c.toDataURL("image/png"); a.download=name+suffix+".tif"; }
-          else { a.href=c.toDataURL("image/png"); a.download=name+suffix+".png"; }
-          a.click();
-        };
-        img.src = "data:image/svg+xml;base64,"+btoa(unescape(encodeURIComponent(svgStr)));
+        prepareSVGForExport(clone, svgWpx, svgHpx);
+        const cv = await rasterizeSVG(serializeSVG(clone), pxW, pxH, svgWpx, svgHpx, canvas.bg||"#ffffff");
+        const ext = format==="jpeg" ? ".jpg" : format==="tiff" ? ".tif" : ".png";
+        downloadBlob(await encodeCanvas(cv, format, dpi), name+"_"+dpi+"dpi"+ext);
       }
       setDone(true); setTimeout(()=>setDone(false),1500);
-    } finally { setSaving(false); }
+    } catch(e) { setErr((e&&e.message)?e.message:"Export failed."); }
+    finally { setSaving(false); }
   };
 
   const FORMATS=[{id:"png",l:"PNG",sub:"Best for most journals"},{id:"jpeg",l:"JPEG",sub:"Smaller file size"},{id:"tiff",l:"TIFF",sub:"ImageJ / Photoshop"},{id:"svg",l:"SVG",sub:"True vector — best for revision"}];
@@ -451,6 +444,11 @@ function ExportPanel({canvasRef, canvas}) {
           background:done?t.success:t.accent, border:"none", color:"#fff", transition:"background .2s"}}>
         {done?"Saved!":saving?"Saving...":"Download "+format.toUpperCase()}
       </button>
+      {err&&(
+        <div style={{marginTop:10, padding:"8px 10px", borderRadius:7, fontSize:11, lineHeight:1.5, color:t.danger, background:"rgba(220,38,38,.07)", border:"1px solid rgba(220,38,38,.25)"}}>
+          <strong>Download failed.</strong> {err}
+        </div>
+      )}
     </div>
   );
 }

@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
-import { ThemeCtx as TC, useTheme } from "../shared/theme";
+import { ThemeCtx as TC, useTheme, LIGHT } from "../shared/theme";
 import CloudProjects from "../shared/CloudProjects";
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -1548,7 +1548,8 @@ export default function VennDiagramPage() {
             <div style={{marginBottom:10, fontSize:12, color:C.muted}}>
               {names.length} sets, {totalUnion} genes in union — showing <strong style={{color:C.text}}>{effectiveMode==="venn"?"Venn diagram":"UpSet plot"}</strong>{modeNote}
             </div>
-            <div style={{background:d.pbg||C.panel, border:"1px solid "+C.border, borderRadius:10, padding:"16px", boxShadow:C.shadow, overflowX:"auto"}}>
+            <TC.Provider value={LIGHT}>{/* Figure always on white paper with the light palette (see VolcanoPlot). */}
+            <div style={{background:d.pbg||LIGHT.panel, border:"1px solid "+C.border, borderRadius:10, padding:"16px", boxShadow:C.shadow, overflowX:"auto"}}>
               {n===0 ? (
                 <div style={{padding:40, color:C.muted, fontSize:13}}>Add at least one gene list to see the diagram.</div>
               ) : effectiveMode==="venn" ? (
@@ -1557,6 +1558,7 @@ export default function VennDiagramPage() {
                 <UpSetPlot names={names} setSizes={setSizes} regionList={regionList} d={d} svgRef={svgExportRef} totalUnion={totalUnion}/>
               )}
             </div>
+            </TC.Provider>
             <div style={{marginTop:10, fontSize:11, color:C.muted}}>
               {sheets.length} sheet{sheets.length!==1?"s":""} · Ctrl+S to save
             </div>

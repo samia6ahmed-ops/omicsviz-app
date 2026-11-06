@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
-import { ThemeCtx as TC, useTheme } from "../shared/theme";
+import { ThemeCtx as TC, useTheme, LIGHT } from "../shared/theme";
 import CloudProjects from "../shared/CloudProjects";
 
 // ─── Themes ───────────────────────────────────────────────────────────────────
@@ -239,6 +239,17 @@ function queryHitIndex(index, px, py, maxDist) {
 // the left when the text would otherwise run past the plot edge — previously
 // labels were allowed 30px of overshoot, which pushed long names (novel_circ_*)
 // straight over the legend. x is always the LEFT edge of the text.
+function niceTicks(lo, hi, target) {
+  if (!(hi > lo)) return {ticks:[lo], dec:1};
+  const raw = (hi - lo) / Math.max(1, target);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw) || 10 * mag;
+  const ticks = [];
+  for (let v = Math.ceil(lo / step - 1e-9) * step; v <= hi + 1e-9; v += step) ticks.push(+v.toFixed(10));
+  const dec = Math.max(0, -Math.floor(Math.log10(step) + 1e-9) + (Math.abs(step / mag - 2.5) < 1e-9 ? 1 : 0));
+  return {ticks: ticks.map(v => Math.abs(v) < 1e-12 ? 0 : v), dec};
+}
+
 function labelHome(cx, cy, wEst, r, leftBound, rightBound) {
   let x = (cx + r + 3 + wEst <= rightBound) ? cx + r + 3 : cx - r - 3 - wEst;
   x = Math.max(leftBound, Math.min(rightBound - wEst, x));
@@ -1513,6 +1524,7 @@ function ExportPanel({plotRef, d, rows}) {
       const svgEl=plotRef&&plotRef.current&&plotRef.current.querySelector("svg");
       if(!svgEl){ setErr("Couldn't find the plot. Switch to the Plot or Split view and try again."); return; }
       const clone=svgEl.cloneNode(true);
+      clone.style.removeProperty("width"); clone.style.removeProperty("max-width"); clone.style.removeProperty("height"); // on-screen scaling only
       clone.setAttribute("xmlns","http://www.w3.org/2000/svg");
       const vbAttr=svgEl.getAttribute("viewBox")||"0 0 700 420";
       const vbParts=vbAttr.split(" ").map(Number);
@@ -1520,7 +1532,7 @@ function ExportPanel({plotRef, d, rows}) {
       const box=trim?tightViewBox(svgEl,fullW,fullH,4):{x:0,y:0,w:fullW,h:fullH};
       const svgW=box.w, svgH=box.h;
       clone.setAttribute("viewBox",box.x+" "+box.y+" "+box.w+" "+box.h);
-      const bgFill=d.pbg||(fmt==="jpeg"?"#ffffff":C.panel);
+      const bgFill=d.pbg||"#ffffff"; // figures are always on white paper
       const bgR=document.createElementNS("http://www.w3.org/2000/svg","rect");
       bgR.setAttribute("x",box.x); bgR.setAttribute("y",box.y);
       bgR.setAttribute("width",box.w); bgR.setAttribute("height",box.h); bgR.setAttribute("fill",bgFill);
@@ -1847,38 +1859,79 @@ function VolcanoPlot({data, sets, d, geneSetParsed, geneSetColor, legVis, legSty
     const py=(e.clientY-box.top)*(H/box.height);
     return queryHitIndex(hitIndex, px, py, r+5);
   },[hitIndex,r,SVGW,H]);
-  const xTks=useMemo(()=>[0,1,2,3,4,5,6].map(i=>+(x1+i*(x2-x1)/6).toFixed(1)),[x1,x2]);
-  const yTks=useMemo(()=>[0,1,2,3,4,5].map(i=>+(y1+i*(y2-y1)/5).toFixed(1)),[y1,y2]);
+  // Round-number ticks (1/2/2.5/5 x 10^k), the way Prism and ggplot place them.
+  // Evenly splitting the range into sixths gave values like -3.7 / -1.9 that
+  // land next to the FC threshold markers and read as noise.
+  const xTk=useMemo(()=>niceTicks(x1,x2,6),[x1,x2]);
+  const yTk=useMemo(()=>niceTicks(y1,y2,5),[y1,y2]);
+  const xTks=xTk.ticks, yTks=yTk.ticks;
 
   // ── Label repulsion ──────────────────────────────────────────────────────
+  // Labels are drawn text-anchor "start" at (x, y=baseline), so each label's
+  // box is [x, x+w] x [y-h+1, y+2]. The previous version treated x as the box
+  // centre and only pushed labels away from other labels — never from dots —
+  // so names routinely landed on top of neighbouring points.
   const labelPositions=useMemo(()=>{
     const all=proc.filter(p=>labeled.has(p.gene)||autoLabeled.has(p.gene));
     if(!all.length||!repel)return{};
+    const lbFs=st.lb.fontSize||9, charW=lbFs*0.58, h=lbFs+1;
+    const L=ML+2, R=ML+PW-2, T=MT+2, B=MT+PH-2;
+    // Every visible dot is an obstacle; decorated dots use their halo radius.
+    const CELL=24, grid=new Map();
+    proc.forEach(p=>{
+      const cx=sx(p.log2fc), cy=sy(p.nlp);
+      if(!(cx>=ML&&cx<=ML+PW&&cy>=MT&&cy<=MT+PH))return;
+      const deco=labeled.has(p.gene)||autoLabeled.has(p.gene)||inGS(p.gene);
+      const o={x:cx,y:cy,r:(deco?r+5:r)+1.5};
+      const k=Math.floor(cx/CELL)+","+Math.floor(cy/CELL);
+      if(!grid.has(k))grid.set(k,[]); grid.get(k).push(o);
+    });
+    const near=(x0,y0,x1,y1)=>{
+      const out=[];
+      for(let gx=Math.floor((x0-12)/CELL);gx<=Math.floor((x1+12)/CELL);gx++)
+        for(let gy=Math.floor((y0-12)/CELL);gy<=Math.floor((y1+12)/CELL);gy++){const c=grid.get(gx+","+gy);if(c)for(const o of c)out.push(o);}
+      return out;
+    };
     const pos={};
-    const lbFs=st.lb.fontSize||9, charW=lbFs*0.58;
     all.forEach(p=>{
       const cx=sx(p.log2fc), cy=sy(p.nlp), w=p.gene.length*charW+2;
-      const home=labelHome(cx,cy,w,r,ML+2,ML+PW-2);
-      pos[p.gene]={x:home.x,y:home.y,ox:cx,oy:cy,hx:home.x,w,h:lbFs+1};
+      const home=labelHome(cx,cy,w,r,L,R);
+      pos[p.gene]={x:home.x,y:home.y,ox:cx,oy:cy,hx:home.x,hy:home.y,w,h};
     });
     const genes=Object.keys(pos);
-    for(let it=0;it<30;it++){
+    for(let it=0;it<150;it++){
+      let moved=0;
       genes.forEach(g=>{
-        const pp=pos[g];let fx=0,fy=0;
+        const a=pos[g]; let fx=0, fy=0;
+        const ax0=a.x, ax1=a.x+a.w, ay0=a.y-a.h+1, ay1=a.y+2;
+        // label vs label: separate along the axis of least overlap
         genes.forEach(g2=>{
           if(g===g2)return;
-          const p2=pos[g2],dx=pp.x-p2.x,dy=pp.y-p2.y;
-          const ox=Math.max(0,(pp.w/2+p2.w/2+2)-Math.abs(dx));
-          const oy2=Math.max(0,(pp.h+p2.h+3)-Math.abs(dy));
-          if(ox>0&&oy2>0){fx+=dx>=0?ox*0.5:-ox*0.5;fy+=dy>=0?oy2*0.4:-oy2*0.4;}
+          const b=pos[g2], bx0=b.x, bx1=b.x+b.w, by0=b.y-b.h+1, by1=b.y+2;
+          const ox=Math.min(ax1,bx1)-Math.max(ax0,bx0)+2, oy=Math.min(ay1,by1)-Math.max(ay0,by0)+2;
+          if(ox>0&&oy>0){
+            const dx=(ax0+ax1)-(bx0+bx1), dy=(ay0+ay1)-(by0+by1);
+            if(oy<=ox) fy+=(dy>=0?1:-1)*oy*0.5; else fx+=(dx>=0?1:-1)*ox*0.5;
+          }
         });
-        fx+=(pp.hx-pp.x)*0.05;fy+=(pp.oy+4-pp.y)*0.05;
-        pp.x+=fx;pp.y+=fy;
-        pp.x=Math.max(ML+2,Math.min(ML+PW-pp.w,pp.x));pp.y=Math.max(MT+8,Math.min(MT+PH-2,pp.y));
+        // label vs dots: push the box out of every circle it touches
+        near(ax0,ay0,ax1,ay1).forEach(o=>{
+          const nx=Math.max(ax0,Math.min(o.x,ax1)), ny=Math.max(ay0,Math.min(o.y,ay1));
+          let dx=nx-o.x, dy=ny-o.y; const dd=Math.hypot(dx,dy);
+          if(dd>=o.r)return;
+          if(dd<1e-6){dx=(ax0+ax1)/2-o.x; dy=(ay0+ay1)/2-o.y; const m=Math.hypot(dx,dy)||1; dx/=m; dy/=m;}
+          else {dx/=dd; dy/=dd;}
+          const push=(o.r-dd)*0.6; fx+=dx*push; fy+=dy*push;
+        });
+        // weak spring back toward the label's own dot
+        fx+=(a.hx-a.x)*0.02; fy+=(a.hy-a.y)*0.02;
+        const nx=Math.max(L,Math.min(R-a.w,a.x+fx)), ny=Math.max(T+a.h,Math.min(B,a.y+fy));
+        moved+=Math.abs(nx-a.x)+Math.abs(ny-a.y); a.x=nx; a.y=ny;
       });
+      if(moved<0.05)break;
     }
     return pos;
-  },[proc,labeled,autoLabeled,repel,r,sx,sy,st.lb.fontSize,ML,PW,MT,PH]);
+  },[proc,labeled,autoLabeled,repel,r,sx,sy,st.lb.fontSize,ML,PW,MT,PH,inGS]);
 
   // ── Legend ──────────────────────────────────────────────────────────────
   const LW=158;
@@ -2012,7 +2065,7 @@ function VolcanoPlot({data, sets, d, geneSetParsed, geneSetColor, legVis, legSty
         {d.plotTitle&&<div style={{textAlign:"center",marginBottom:6,fontSize:st.ttl.fontSize,fontWeight:st.ttl.fontWeight,fontStyle:st.ttl.fontStyle,color:st.ttl.color,fontFamily:st.ff}}>{d.plotTitle}</div>}
         {editingRow&&<input ref={editInputRef} value={editVal} onChange={e=>setEditVal(e.target.value)} onBlur={commitEdit} onKeyDown={e=>{if(e.key==="Enter")commitEdit();if(e.key==="Escape")cancelEdit();}} style={getEditStyle()}/>}
         <svg ref={svgRef} width={SVGW} height={H} viewBox={"0 0 "+SVGW+" "+H}
-          style={{display:"block",cursor:legDrag?"grabbing":labelMode?"crosshair":"default",overflow:"visible"}}
+          style={{display:"block",width:"100%",maxWidth:SVGW,height:"auto",cursor:legDrag?"grabbing":labelMode?"crosshair":"default",overflow:"visible"}}
           onPointerMove={onSVGMove} onPointerUp={onSVGUp} onPointerLeave={onSVGUp}>
           {d.showGrid!==false&&yTks.map((v,i)=><line key={"gy"+i} x1={ML} y1={sy(v)} x2={ML+PW} y2={sy(v)} stroke={st.grid} strokeWidth={st.gw} strokeDasharray="4 3"/>)}
           {d.showGrid!==false&&xTks.map((v,i)=><line key={"gx"+i} x1={sx(v)} y1={MT} x2={sx(v)} y2={MT+PH} stroke={st.grid} strokeWidth={st.gw} strokeDasharray="4 3"/>)}
@@ -2033,10 +2086,12 @@ function VolcanoPlot({data, sets, d, geneSetParsed, geneSetColor, legVis, legSty
               </g>
             );
           })()}
-          {yTks.map((v,i)=><text key={"yt"+i} x={ML-6} y={sy(v)+4} textAnchor="end" fontSize={st.tk.fontSize} fill={st.tk.fill} fontFamily={ff}>{v.toFixed(1)}</text>)}
-          {xTks.map((v,i)=><text key={"xt"+i} x={sx(v)} y={MT+PH+16} textAnchor="middle" fontSize={st.tk.fontSize} fill={st.tk.fill} fontFamily={ff}>{v.toFixed(1)}</text>)}
-          <text x={sx(fc)} y={MT+PH+16} textAnchor="middle" fontSize={9} fill={st.cu} fontFamily={ff} fontWeight="600">{fc}</text>
-          <text x={sx(-fc)} y={MT+PH+16} textAnchor="middle" fontSize={9} fill={st.cd} fontFamily={ff} fontWeight="600">{-fc}</text>
+          {yTks.map((v,i)=><text key={"yt"+i} x={ML-6} y={sy(v)+4} textAnchor="end" fontSize={st.tk.fontSize} fill={st.tk.fill} fontFamily={ff}>{v.toFixed(yTk.dec)}</text>)}
+          {xTks.map((v,i)=><text key={"xt"+i} x={sx(v)} y={MT+PH+16} textAnchor="middle" fontSize={st.tk.fontSize} fill={st.tk.fill} fontFamily={ff}>{v.toFixed(xTk.dec)}</text>)}
+          {/* FC threshold values sit above the plot at the top of their dashed
+              lines, so they can never collide with the x-axis tick labels. */}
+          <text x={sx(fc)} y={MT-6} textAnchor="middle" fontSize={9} fill={st.cu} fontFamily={ff} fontWeight="600">{fc}</text>
+          <text x={sx(-fc)} y={MT-6} textAnchor="middle" fontSize={9} fill={st.cd} fontFamily={ff} fontWeight="600">{-fc}</text>
           <text x={ML+PW/2} y={H-4} textAnchor="middle" fontSize={st.ax.fontSize} fontWeight={st.ax.fontWeight} fontStyle={st.ax.fontStyle} fill={st.ax.fill} fontFamily={ff}>{d.xLbl||"log2 Fold Change"}</text>
           <text x={12} y={MT+PH/2} textAnchor="middle" fontSize={st.ax.fontSize} fontWeight={st.ax.fontWeight} fontStyle={st.ax.fontStyle} fill={st.ax.fill} fontFamily={ff} transform={"rotate(-90,12,"+(MT+PH/2)+")"}>{d.yLbl||"-log10(P value)"}</text>
           <line x1={sx(fc)} y1={MT} x2={sx(fc)} y2={MT+PH} stroke={st.cu} strokeDasharray="5 3" strokeOpacity={0.4} strokeWidth={1}/>
@@ -2068,7 +2123,12 @@ function VolcanoPlot({data, sets, d, geneSetParsed, geneSetColor, legVis, legSty
                 {isGS&&<circle cx={cx} cy={cy} r={r+5} fill={geneSetColor} fillOpacity={0.15} stroke={geneSetColor} strokeWidth={1.5}/>}
                 {isLbl&&<circle cx={cx} cy={cy} r={r+4} fill={lc} fillOpacity={0.15} stroke={lc} strokeWidth={0.8} strokeOpacity={0.4}/>}
                 <circle cx={cx} cy={cy} r={isGS?r+2:r} fill={isGS?geneSetColor:col} fillOpacity={0.9} stroke={isLbl?lc:isGS?geneSetColor:"none"} strokeWidth={isLbl||isGS?1.5:1}/>
-                {isLbl&&repel&&lpos&&(Math.abs(lx2-cx)>4||Math.abs(ly2-cy)>4)&&<line x1={cx} y1={cy} x2={lx2-2} y2={ly2-2} stroke={lc} strokeWidth={0.7} strokeOpacity={0.5} strokeDasharray="2 2"/>}
+                {isLbl&&repel&&lpos&&(()=>{
+                  const tx=Math.max(lpos.x,Math.min(cx,lpos.x+lpos.w)), ty=Math.max(lpos.y-lpos.h+1,Math.min(cy,lpos.y+2));
+                  const dl=Math.hypot(tx-cx,ty-cy); if(dl<r+7)return null;
+                  const sx0=cx+(tx-cx)/dl*(r+4), sy0=cy+(ty-cy)/dl*(r+4);
+                  return <line x1={sx0} y1={sy0} x2={tx} y2={ty} stroke={lc} strokeWidth={0.7} strokeOpacity={0.6}/>;
+                })()}
                 {isLbl&&<text x={lx2} y={ly2} fontSize={st.lb.fontSize||9} fontWeight={st.lb.fontWeight} fontStyle={isAuto&&!isManual?"italic":st.lb.fontStyle} fill={lc} fontFamily={ff} style={{pointerEvents:"none"}}>{p.gene}</text>}
               </g>
             );
@@ -2099,7 +2159,6 @@ function VolcanoPlot({data, sets, d, geneSetParsed, geneSetColor, legVis, legSty
             );
           })()}
           {anyLeg&&renderLegend()}
-          <text x={ML+PW-2} y={H-1} textAnchor="end" fontSize={7} fill={C.muted} opacity={0.4}>{"Y:"+y1.toFixed(1)+"-"+y2.toFixed(1)+" X:"+x1.toFixed(1)+"-"+x2.toFixed(1)}</text>
         </svg>
       </div>
     </div>
@@ -2220,10 +2279,14 @@ export default function VolcanoPlotPage() {
               </div>
             )}
             {(layout==="split"||layout==="plot")&&(
-              <div style={{flex:1,overflowY:"auto",padding:"16px 18px"}} ref={plotRef}>
+              <div style={{flex:1,overflowY:"auto",padding:"16px 18px",minWidth:0}} ref={plotRef}>
+                {/* The figure is always rendered on white "paper" with the light
+                    palette, whatever the app theme — like Prism. Exports match. */}
+                <TC.Provider value={LIGHT}>
                 <ErrorBoundary>
                   <VolcanoPlot data={plotData} sets={sets} d={d} geneSetParsed={geneSetParsed} geneSetColor={geneSetColor||"#7C3AED"} legVis={legVis} legStyle={legStyle} legPos={legPos} setLegPos={setLegPos} labeled={labeled} setLabeled={setLabeled}/>
                 </ErrorBoundary>
+                </TC.Provider>
                 <div style={{marginTop:6,fontSize:11,color:C.muted,textAlign:"center"}}>{filled} rows · {sheets.length} sheet{sheets.length!==1?"s":""} · Ctrl+S to save</div>
                 {layout==="plot"&&<div style={{marginTop:10,textAlign:"center"}}><button onClick={()=>setLayout("sheet")} style={{padding:"5px 14px",borderRadius:6,fontSize:12,cursor:"pointer",background:"transparent",border:"1px solid "+C.border,color:C.muted}}>Back to data</button></div>}
               </div>

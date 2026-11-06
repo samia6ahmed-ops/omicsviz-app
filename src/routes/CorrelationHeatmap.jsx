@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
-import { ThemeCtx, useTheme } from "../shared/theme";
+import { ThemeCtx, useTheme, LIGHT } from "../shared/theme";
 import CloudProjects from "../shared/CloudProjects";
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1554,7 +1554,7 @@ function ExportPanel({plotRef, display, labels, corrMatrix, pMatrix, method}) {
       clone.setAttribute("xmlns","http://www.w3.org/2000/svg");
       const vb=(svgEl.getAttribute("viewBox")||"0 0 700 420").split(" ").map(Number);
       const svgW=vb[2]||700, svgH=vb[3]||420;
-      const bgFill=format==="jpeg"?"#ffffff":t.panel;
+      const bgFill="#ffffff"; // figures are always on white paper
       const bgRect=document.createElementNS("http://www.w3.org/2000/svg","rect");
       bgRect.setAttribute("width","100%"); bgRect.setAttribute("height","100%"); bgRect.setAttribute("fill",bgFill);
       clone.insertBefore(bgRect,clone.firstChild);
@@ -2231,10 +2231,12 @@ export default function CorrelationHeatmapPage() {
             {(layout==="split"||layout==="plot")&&(
               <div style={{flex:1,overflowY:"auto",padding:"16px 18px",minWidth:0}} ref={plotRef}>
                 {result.labels.length>0 ? (
+                  <ThemeCtx.Provider value={LIGHT}>{/* Figure always on white paper with the light palette (see VolcanoPlot). */}
                   <ErrorBoundary>
                     <CorrHeatmap labels={result.labels} corrMatrix={result.corrMatrix} pMatrix={result.pMatrix} display={display} stats={stats}
                       itemGroups={result.itemGroups} groupColors={result.itemGroups?groupColors:{}}/>
                   </ErrorBoundary>
+                  </ThemeCtx.Provider>
                 ) : (
                   <div style={{padding:"60px 20px",textAlign:"center",color:activeTheme.muted,fontSize:12}}>
                     {stats.mode==="sample"

@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
-import { ThemeCtx, useTheme } from "../shared/theme";
+import { ThemeCtx, useTheme, LIGHT } from "../shared/theme";
 import CloudProjects from "../shared/CloudProjects";
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -637,6 +637,17 @@ const GRID_ROW_CAP = 300;
 // the left when the text would otherwise run past the plot edge — previously
 // labels were allowed 30px of overshoot, which pushed long names (novel_circ_*)
 // straight over the legend. x is always the LEFT edge of the text.
+function niceTicks(lo, hi, target) {
+  if (!(hi > lo)) return {ticks:[lo], dec:1};
+  const raw = (hi - lo) / Math.max(1, target);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw) || 10 * mag;
+  const ticks = [];
+  for (let v = Math.ceil(lo / step - 1e-9) * step; v <= hi + 1e-9; v += step) ticks.push(+v.toFixed(10));
+  const dec = Math.max(0, -Math.floor(Math.log10(step) + 1e-9) + (Math.abs(step / mag - 2.5) < 1e-9 ? 1 : 0));
+  return {ticks: ticks.map(v => Math.abs(v) < 1e-12 ? 0 : v), dec};
+}
+
 function labelHome(cx, cy, wEst, r, leftBound, rightBound) {
   let x = (cx + r + 3 + wEst <= rightBound) ? cx + r + 3 : cx - r - 3 - wEst;
   x = Math.max(leftBound, Math.min(rightBound - wEst, x));
@@ -1607,13 +1618,14 @@ function ExportPanel({plotRef, display, rows}) {
       const svgEl = plotRef && plotRef.current && plotRef.current.querySelector("svg");
       if (!svgEl) { setErr("Couldn't find the plot. Switch to the Plot or Split view and try again."); return; }
       const clone = svgEl.cloneNode(true);
+      clone.style.removeProperty("width"); clone.style.removeProperty("max-width"); clone.style.removeProperty("height"); // on-screen scaling only
       clone.setAttribute("xmlns","http://www.w3.org/2000/svg");
       const vb = (svgEl.getAttribute("viewBox")||"0 0 700 420").split(" ").map(Number);
       const fullW=vb[2]||700, fullH=vb[3]||420;
       const box = trim ? tightViewBox(svgEl, fullW, fullH, 4) : {x:0,y:0,w:fullW,h:fullH};
       const svgW=box.w, svgH=box.h;
       clone.setAttribute("viewBox", box.x+" "+box.y+" "+box.w+" "+box.h);
-      const bgFill = display.plotBg || (format==="jpeg" ? "#ffffff" : t.panel);
+      const bgFill = display.plotBg || "#ffffff"; // figures are always on white paper
       const bgRect = document.createElementNS("http://www.w3.org/2000/svg","rect");
       bgRect.setAttribute("x",box.x); bgRect.setAttribute("y",box.y);
       bgRect.setAttribute("width",box.w); bgRect.setAttribute("height",box.h); bgRect.setAttribute("fill",bgFill);
@@ -1915,8 +1927,11 @@ function MAPlot({data, stats, display, geneSetParsed, geneSetColor, legendVisibl
 
   const scaleX = useCallback(v=>MARGIN_L+(v-x1)/(x2-x1)*innerW,[x1,x2,innerW]);
   const scaleY = useCallback(v=>MARGIN_T+PLOT_H-(v-y1)/(y2-y1)*PLOT_H,[y1,y2]);
-  const xTicks = useMemo(()=>[0,1,2,3,4,5,6].map(i=>+(x1+i*(x2-x1)/6).toFixed(1)),[x1,x2]);
-  const yTicks = useMemo(()=>[0,1,2,3,4,5].map(i=>+(y1+i*(y2-y1)/5).toFixed(1)),[y1,y2]);
+  // Round-number ticks (1/2/2.5/5 x 10^k) instead of equal sixths of the range,
+  // which produced values like -0.6 / 0.3 / 1.1.
+  const xTk = useMemo(()=>niceTicks(x1,x2,6),[x1,x2]);
+  const yTk = useMemo(()=>niceTicks(y1,y2,5),[y1,y2]);
+  const xTicks = xTk.ticks, yTicks = yTk.ticks;
 
   // ── Density-aware rendering — keeps large datasets (10k+ genes) legible ──
   const nPoints = points.length;
@@ -1976,34 +1991,68 @@ function MAPlot({data, stats, display, geneSetParsed, geneSetColor, legendVisibl
     return smoothed.map((p,i)=>(i===0?"M ":"L ")+scaleX(p[0]).toFixed(2)+" "+scaleY(p[1]).toFixed(2)).join(" ");
   },[points, showTrend, trendSpan, scaleX, scaleY]);
 
-  // ── Label repulsion (simple force-directed separation) ────────────────────
+  // ── Label repulsion ───────────────────────────────────────────────────────
+  // Labels are drawn text-anchor "start" at (x, y=baseline): box is
+  // [x, x+w] x [y-h+1, y+2]. The previous version read an unset pos.hx
+  // (NaN), so every repelled label got x=NaN and never rendered; it also
+  // treated x as the box centre and ignored dots as obstacles.
   const labelPositions = useMemo(()=>{
     const labeledPoints = points.filter(p=>labeled.has(p.gene)||autoLabeledGenes.has(p.gene));
     if (!labeledPoints.length || !repel) return {};
+    const lbFs=style.pointLabel.fontSize||9, charW=lbFs*0.58, h=lbFs+1;
+    const L=MARGIN_L+2, R=MARGIN_L+innerW-2, T=MARGIN_T+2, B=MARGIN_T+PLOT_H-2;
+    const CELL=24, grid=new Map();
+    points.forEach(p=>{
+      const cx=scaleX(p.a), cy=scaleY(p.log2fc);
+      if(!(cx>=MARGIN_L&&cx<=MARGIN_L+innerW&&cy>=MARGIN_T&&cy<=MARGIN_T+PLOT_H))return;
+      const deco=labeled.has(p.gene)||autoLabeledGenes.has(p.gene)||isInGeneSet(p.gene);
+      const o={x:cx,y:cy,r:(deco?r+5:r)+1.5};
+      const k=Math.floor(cx/CELL)+","+Math.floor(cy/CELL);
+      if(!grid.has(k))grid.set(k,[]); grid.get(k).push(o);
+    });
+    const near=(x0,y0,x1_,y1_)=>{
+      const out=[];
+      for(let gx=Math.floor((x0-12)/CELL);gx<=Math.floor((x1_+12)/CELL);gx++)
+        for(let gy=Math.floor((y0-12)/CELL);gy<=Math.floor((y1_+12)/CELL);gy++){const c=grid.get(gx+","+gy);if(c)for(const o of c)out.push(o);}
+      return out;
+    };
     const positions = {};
     labeledPoints.forEach(p=>{
-      const cx=scaleX(p.a), cy=scaleY(p.log2fc);
-      positions[p.gene] = {x:cx+r+3, y:cy+4, ox:cx, oy:cy, w:(p.gene.length*6)+4, h:10};
+      const cx=scaleX(p.a), cy=scaleY(p.log2fc), w=p.gene.length*charW+2;
+      const home=labelHome(cx,cy,w,r,L,R);
+      positions[p.gene]={x:home.x,y:home.y,ox:cx,oy:cy,hx:home.x,hy:home.y,w,h};
     });
     const genes = Object.keys(positions);
-    for (let iter=0; iter<30; iter++) {
+    for (let it=0; it<150; it++) {
+      let moved=0;
       genes.forEach(g=>{
-        const pos=positions[g]; let fx=0, fy=0;
+        const a_=positions[g]; let fx=0, fy=0;
+        const ax0=a_.x, ax1=a_.x+a_.w, ay0=a_.y-a_.h+1, ay1=a_.y+2;
         genes.forEach(g2=>{
-          if (g===g2) return;
-          const other=positions[g2], dx=pos.x-other.x, dy=pos.y-other.y;
-          const overlapX=Math.max(0,(pos.w/2+other.w/2+2)-Math.abs(dx));
-          const overlapY=Math.max(0,(pos.h+other.h+3)-Math.abs(dy));
-          if (overlapX>0 && overlapY>0) { fx += dx>=0 ? overlapX*0.5 : -overlapX*0.5; fy += dy>=0 ? overlapY*0.4 : -overlapY*0.4; }
+          if(g===g2)return;
+          const b_=positions[g2], bx0=b_.x, bx1=b_.x+b_.w, by0=b_.y-b_.h+1, by1=b_.y+2;
+          const ox=Math.min(ax1,bx1)-Math.max(ax0,bx0)+2, oy=Math.min(ay1,by1)-Math.max(ay0,by0)+2;
+          if(ox>0&&oy>0){
+            const dx=(ax0+ax1)-(bx0+bx1), dy=(ay0+ay1)-(by0+by1);
+            if(oy<=ox) fy+=(dy>=0?1:-1)*oy*0.5; else fx+=(dx>=0?1:-1)*ox*0.5;
+          }
         });
-        fx += (pos.hx-pos.x)*0.05; fy += (pos.oy+4-pos.y)*0.05;
-        pos.x += fx; pos.y += fy;
-        pos.x = Math.max(MARGIN_L+2, Math.min(MARGIN_L+innerW-pos.w, pos.x));
-        pos.y = Math.max(MARGIN_T+8, Math.min(MARGIN_T+PLOT_H-2, pos.y));
+        near(ax0,ay0,ax1,ay1).forEach(o=>{
+          const nx=Math.max(ax0,Math.min(o.x,ax1)), ny=Math.max(ay0,Math.min(o.y,ay1));
+          let dx=nx-o.x, dy=ny-o.y; const dd=Math.hypot(dx,dy);
+          if(dd>=o.r)return;
+          if(dd<1e-6){dx=(ax0+ax1)/2-o.x; dy=(ay0+ay1)/2-o.y; const m=Math.hypot(dx,dy)||1; dx/=m; dy/=m;}
+          else {dx/=dd; dy/=dd;}
+          const push=(o.r-dd)*0.6; fx+=dx*push; fy+=dy*push;
+        });
+        fx+=(a_.hx-a_.x)*0.02; fy+=(a_.hy-a_.y)*0.02;
+        const nx=Math.max(L,Math.min(R-a_.w,a_.x+fx)), ny=Math.max(T+a_.h,Math.min(B,a_.y+fy));
+        moved+=Math.abs(nx-a_.x)+Math.abs(ny-a_.y); a_.x=nx; a_.y=ny;
       });
+      if(moved<0.05)break;
     }
     return positions;
-  },[points, labeled, autoLabeledGenes, repel, r, scaleX, scaleY]);
+  },[points, labeled, autoLabeledGenes, repel, r, scaleX, scaleY, isInGeneSet, style.pointLabel.fontSize, innerW]);
 
   // ── Legend rows ──────────────────────────────────────────────────────────
   const LEGEND_W=158;
@@ -2147,7 +2196,7 @@ function MAPlot({data, stats, display, geneSetParsed, geneSetColor, legendVisibl
         {display.plotTitle&&<div style={{textAlign:"center",marginBottom:6,fontSize:style.title.fontSize,fontWeight:style.title.fontWeight,fontStyle:style.title.fontStyle,color:style.title.color,fontFamily:style.font}}>{display.plotTitle}</div>}
         {editingRow&&<input ref={editInputRef} value={editValue} onChange={e=>setEditValue(e.target.value)} onBlur={commitLabelEdit} onKeyDown={e=>{if(e.key==="Enter")commitLabelEdit();if(e.key==="Escape")cancelLabelEdit();}} style={editInputStyle()}/>}
         <svg ref={svgRef} width={svgW} height={totalH} viewBox={"0 0 "+svgW+" "+totalH}
-          style={{display:"block",cursor:legendDrag?"grabbing":labelMode?"crosshair":"default",overflow:"visible"}}
+          style={{display:"block",width:"100%",maxWidth:svgW,height:"auto",cursor:legendDrag?"grabbing":labelMode?"crosshair":"default",overflow:"visible"}}
           onPointerMove={onSvgPointerMove} onPointerUp={onSvgPointerUp} onPointerLeave={onSvgPointerUp}>
           {display.showGrid!==false&&yTicks.map((v,i)=><line key={"gy"+i} x1={MARGIN_L} y1={scaleY(v)} x2={MARGIN_L+innerW} y2={scaleY(v)} stroke={style.gridColor} strokeWidth={style.gridWidth} strokeDasharray="4 3"/>)}
           {display.showGrid!==false&&xTicks.map((v,i)=><line key={"gx"+i} x1={scaleX(v)} y1={MARGIN_T} x2={scaleX(v)} y2={MARGIN_T+PLOT_H} stroke={style.gridColor} strokeWidth={style.gridWidth} strokeDasharray="4 3"/>)}
@@ -2168,8 +2217,8 @@ function MAPlot({data, stats, display, geneSetParsed, geneSetColor, legendVisibl
               </g>
             );
           })()}
-          {yTicks.map((v,i)=><text key={"yt"+i} x={MARGIN_L-6} y={scaleY(v)+4} textAnchor="end" fontSize={style.tick.fontSize} fill={style.tick.fill} fontFamily={style.font}>{v.toFixed(1)}</text>)}
-          {xTicks.map((v,i)=><text key={"xt"+i} x={scaleX(v)} y={MARGIN_T+PLOT_H+16} textAnchor="middle" fontSize={style.tick.fontSize} fill={style.tick.fill} fontFamily={style.font}>{v.toFixed(1)}</text>)}
+          {yTicks.map((v,i)=><text key={"yt"+i} x={MARGIN_L-6} y={scaleY(v)+4} textAnchor="end" fontSize={style.tick.fontSize} fill={style.tick.fill} fontFamily={style.font}>{v.toFixed(yTk.dec)}</text>)}
+          {xTicks.map((v,i)=><text key={"xt"+i} x={scaleX(v)} y={MARGIN_T+PLOT_H+16} textAnchor="middle" fontSize={style.tick.fontSize} fill={style.tick.fill} fontFamily={style.font}>{v.toFixed(xTk.dec)}</text>)}
           <text x={MARGIN_L+innerW/2} y={totalH-4} textAnchor="middle" fontSize={style.axis.fontSize} fontWeight={style.axis.fontWeight} fontStyle={style.axis.fontStyle} fill={style.axis.fill} fontFamily={style.font}>{display.xLbl||"Mean of Normalized Counts (log10)"}</text>
           <text x={12} y={MARGIN_T+PLOT_H/2} textAnchor="middle" fontSize={style.axis.fontSize} fontWeight={style.axis.fontWeight} fontStyle={style.axis.fontStyle} fill={style.axis.fill} fontFamily={style.font} transform={"rotate(-90,12,"+(MARGIN_T+PLOT_H/2)+")"}>{display.yLbl||"log2 Fold Change"}</text>
           {/* M = 0 baseline — standard MA-plot reference */}
@@ -2197,13 +2246,19 @@ function MAPlot({data, stats, display, geneSetParsed, geneSetColor, legendVisibl
             const isGeneSetHit=isInGeneSet(p.gene);
             const cx=scaleX(p.a), cy=scaleY(p.log2fc);
             const labelPos = isLabeled&&repel ? labelPositions[p.gene] : null;
-            const lx=labelPos?labelPos.x:cx+r+3, ly=labelPos?labelPos.y:cy+4;
+            const lhome=labelPos?null:labelHome(cx,cy,p.gene.length*((style.pointLabel.fontSize||9)*0.58)+2,r,MARGIN_L+2,MARGIN_L+innerW-2);
+            const lx=labelPos?labelPos.x:lhome.x, ly=labelPos?labelPos.y:lhome.y;
             return (
               <g key={"sp"+i} style={{pointerEvents:"none"}}>
                 {isGeneSetHit&&<circle cx={cx} cy={cy} r={r+5} fill={geneSetColor} fillOpacity={0.15} stroke={geneSetColor} strokeWidth={1.5}/>}
                 {isLabeled&&<circle cx={cx} cy={cy} r={r+4} fill={labelColor} fillOpacity={0.15} stroke={labelColor} strokeWidth={0.8} strokeOpacity={0.4}/>}
                 <circle cx={cx} cy={cy} r={isGeneSetHit?r+2:r} fill={isGeneSetHit?geneSetColor:col} fillOpacity={0.9} stroke={isLabeled?labelColor:isGeneSetHit?geneSetColor:"none"} strokeWidth={isLabeled||isGeneSetHit?1.5:1}/>
-                {isLabeled&&repel&&labelPos&&(Math.abs(lx-cx)>4||Math.abs(ly-cy)>4)&&<line x1={cx} y1={cy} x2={lx-2} y2={ly-2} stroke={labelColor} strokeWidth={0.7} strokeOpacity={0.5} strokeDasharray="2 2"/>}
+                {isLabeled&&repel&&labelPos&&(()=>{
+                  const tx=Math.max(labelPos.x,Math.min(cx,labelPos.x+labelPos.w)), ty=Math.max(labelPos.y-labelPos.h+1,Math.min(cy,labelPos.y+2));
+                  const dl=Math.hypot(tx-cx,ty-cy); if(dl<r+7)return null;
+                  const sx0=cx+(tx-cx)/dl*(r+4), sy0=cy+(ty-cy)/dl*(r+4);
+                  return <line x1={sx0} y1={sy0} x2={tx} y2={ty} stroke={labelColor} strokeWidth={0.7} strokeOpacity={0.6}/>;
+                })()}
                 {isLabeled&&<text x={lx} y={ly} fontSize={style.pointLabel.fontSize||9} fontWeight={style.pointLabel.fontWeight} fontStyle={isAuto&&!isManual?"italic":style.pointLabel.fontStyle} fill={labelColor} fontFamily={style.font} style={{pointerEvents:"none"}}>{p.gene}</text>}
               </g>
             );
@@ -2234,7 +2289,6 @@ function MAPlot({data, stats, display, geneSetParsed, geneSetColor, legendVisibl
             );
           })()}
           {hasLegend&&renderLegend()}
-          <text x={MARGIN_L+innerW-2} y={totalH-1} textAnchor="end" fontSize={7} fill={t.muted} opacity={0.4}>{"Y:"+y1.toFixed(1)+"-"+y2.toFixed(1)+" X:"+x1.toFixed(1)+"-"+x2.toFixed(1)}</text>
         </svg>
       </div>
     </div>
@@ -2442,10 +2496,13 @@ export default function MAPlotPage() {
               </div>
             )}
             {(layout==="split"||layout==="plot")&&(
-              <div style={{flex:1,overflowY:"auto",padding:"16px 18px"}} ref={plotRef}>
+              <div style={{flex:1,overflowY:"auto",padding:"16px 18px",minWidth:0}} ref={plotRef}>
+                {/* Figure always on white paper with the light palette (see VolcanoPlot). */}
+                <ThemeCtx.Provider value={LIGHT}>
                 <ErrorBoundary>
                   <MAPlot data={plotData} stats={stats} display={display} geneSetParsed={geneSetParsed} geneSetColor={geneSetColor||"#7C3AED"} legendVisible={legendVisible} legendStyle={legendStyle} legendPos={legendPos} setLegendPos={setLegendPos} labeled={labeled} setLabeled={setLabeled}/>
                 </ErrorBoundary>
+                </ThemeCtx.Provider>
                 <div style={{marginTop:6,fontSize:11,color:activeTheme.muted,textAlign:"center"}}>{filledCount} rows · {sheets.length} sheet{sheets.length!==1?"s":""} · Ctrl+S to save</div>
                 {layout==="plot"&&<div style={{marginTop:10,textAlign:"center"}}><button onClick={()=>setLayout("sheet")} style={{padding:"5px 14px",borderRadius:6,fontSize:12,cursor:"pointer",background:"transparent",border:"1px solid "+activeTheme.border,color:activeTheme.muted}}>Back to data</button></div>}
               </div>

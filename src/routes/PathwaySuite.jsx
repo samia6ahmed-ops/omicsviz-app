@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
-import { ThemeCtx as TC, useTheme } from "../shared/theme";
+import { ThemeCtx as TC, useTheme, LIGHT } from "../shared/theme";
 import CloudProjects from "../shared/CloudProjects";
 
 // ═══════════════════════════════════════════════════════════════════════════════
@@ -3217,13 +3217,16 @@ export default function PathwaySuitePage() {
                 </div>
               )}
 
-              <div style={{background:d.pbg||C.panel, border:"1px solid "+C.border, borderRadius:10, padding:"16px", boxShadow:C.shadow, overflowX:"auto"}}>
+              {/* Figure always on white paper with the light palette (see VolcanoPlot). */}
+              <TC.Provider value={LIGHT}>
+              <div style={{background:d.pbg||LIGHT.panel, border:"1px solid "+C.border, borderRadius:10, padding:"16px", boxShadow:C.shadow, overflowX:"auto"}}>
                 <ErrorBoundary>
                   {plotType==="dot" && <DotPlot rows={rows} sets={sets} d={d} svgRef={svgExportRef} onExclude={handleExclude} onDownloadGenes={handleDownloadGenes}/>}
                   {plotType==="bar" && <BarPlot rows={rows} sets={sets} d={d} svgRef={svgExportRef} onExclude={handleExclude} onDownloadGenes={handleDownloadGenes}/>}
                   {plotType==="network" && <NetworkGraph rows={rows} sets={sets} d={d} svgRef={svgExportRef}/>}
                 </ErrorBoundary>
               </div>
+              </TC.Provider>
               <div style={{marginTop:6, fontSize:11, color:C.muted, textAlign:"center"}}>{filled} rows &middot; {sheets.length} sheet{sheets.length!==1?"s":""} &middot; Ctrl+S to save</div>
               {layout==="plot"&&<div style={{marginTop:10, textAlign:"center"}}><button onClick={()=>setLayout("sheet")} style={{padding:"5px 14px", borderRadius:6, fontSize:12, cursor:"pointer", background:"transparent", border:"1px solid "+C.border, color:C.muted}}>Back to data</button></div>}
             </div>

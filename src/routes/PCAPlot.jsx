@@ -1,5 +1,5 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
-import { ThemeCtx, useTheme } from "../shared/theme";
+import { ThemeCtx, useTheme, LIGHT } from "../shared/theme";
 import CloudProjects from "../shared/CloudProjects";
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -1491,10 +1491,11 @@ function ExportPanel({plotRef, display}) {
       const svgEl=plotRef&&plotRef.current&&plotRef.current.querySelector("svg");
       if(!svgEl){ setErr("Couldn't find the plot. Switch to the Plot or Split view and try again."); return; }
       const clone=svgEl.cloneNode(true);
+      clone.style.removeProperty("width"); clone.style.removeProperty("max-width"); clone.style.removeProperty("height"); // on-screen scaling only
       clone.setAttribute("xmlns","http://www.w3.org/2000/svg");
       const vb=(svgEl.getAttribute("viewBox")||"0 0 700 420").split(" ").map(Number);
       const svgW=vb[2]||700, svgH=vb[3]||420;
-      const bgFill=display.plotBg||(format==="jpeg"?"#ffffff":t.panel);
+      const bgFill=display.plotBg||"#ffffff"; // figures are always on white paper
       const bgRect=document.createElementNS("http://www.w3.org/2000/svg","rect");
       bgRect.setAttribute("width","100%"); bgRect.setAttribute("height","100%"); bgRect.setAttribute("fill",bgFill);
       clone.insertBefore(bgRect,clone.firstChild);
@@ -1612,6 +1613,17 @@ function ExportPanel({plotRef, display}) {
 // ════════════════════════════════════════════════════════════════════════════
 // Scree plot — variance explained per PC
 // ════════════════════════════════════════════════════════════════════════════
+function niceTicks(lo, hi, target) {
+  if (!(hi > lo)) return {ticks:[lo], dec:1};
+  const raw = (hi - lo) / Math.max(1, target);
+  const mag = Math.pow(10, Math.floor(Math.log10(raw)));
+  const step = [1, 2, 2.5, 5, 10].map(m => m * mag).find(s => s >= raw) || 10 * mag;
+  const ticks = [];
+  for (let v = Math.ceil(lo / step - 1e-9) * step; v <= hi + 1e-9; v += step) ticks.push(+v.toFixed(10));
+  const dec = Math.max(0, -Math.floor(Math.log10(step) + 1e-9) + (Math.abs(step / mag - 2.5) < 1e-9 ? 1 : 0));
+  return {ticks: ticks.map(v => Math.abs(v) < 1e-12 ? 0 : v), dec};
+}
+
 function ScreePlot({varExplained}) {
   const t=useTheme();
   if (!varExplained.length) return null;
@@ -1624,7 +1636,7 @@ function ScreePlot({varExplained}) {
   return (
     <div style={{background:t.panel, border:"1px solid "+t.border, borderRadius:10, padding:"10px", boxShadow:t.shadow}}>
       <div style={{fontSize:11, fontWeight:700, color:t.text, marginBottom:6}}>Scree Plot — Variance Explained</div>
-      <svg width={W} height={H} viewBox={"0 0 "+W+" "+H}>
+      <svg width={W} height={H} viewBox={"0 0 "+W+" "+H} style={{display:"block",width:"100%",maxWidth:W,height:"auto"}}>
         {[0,0.25,0.5,0.75,1].map((f,i)=>(
           <line key={i} x1={ML} y1={MT+innerH*(1-f)} x2={ML+innerW} y2={MT+innerH*(1-f)} stroke={t.grid} strokeWidth={0.5} strokeDasharray="3 2"/>
         ))}
@@ -1707,8 +1719,10 @@ function PCAScatter({samples, varExplained, stats, display, groupColors, legendV
 
   const scaleX=useCallback(v=>ML+(v-x1)/(x2-x1)*innerW,[x1,x2]);
   const scaleY=useCallback(v=>MT+PLOT_H-(v-y1)/(y2-y1)*PLOT_H,[y1,y2]);
-  const xTicks=useMemo(()=>[0,1,2,3,4,5,6].map(i=>+(x1+i*(x2-x1)/6).toFixed(1)),[x1,x2]);
-  const yTicks=useMemo(()=>[0,1,2,3,4,5].map(i=>+(y1+i*(y2-y1)/5).toFixed(1)),[y1,y2]);
+  // Round-number ticks (1/2/2.5/5 x 10^k) instead of equal sixths of the range.
+  const xTk=useMemo(()=>niceTicks(x1,x2,6),[x1,x2]);
+  const yTk=useMemo(()=>niceTicks(y1,y2,5),[y1,y2]);
+  const xTicks=xTk.ticks, yTicks=yTk.ticks;
 
   const labelPositions = useMemo(()=>{
     if (!showLabels || !repel) return {};
@@ -1815,7 +1829,7 @@ function PCAScatter({samples, varExplained, stats, display, groupColors, legendV
       </div>
       <div ref={svgContainerRef} style={{position:"relative",background:display.plotBg||t.panel,border:"1px solid "+t.border,borderRadius:10,padding:"10px",boxShadow:t.shadow,overflowX:"auto"}}>
         {display.plotTitle&&<div style={{textAlign:"center",marginBottom:6,fontSize:style.title.fontSize,fontWeight:style.title.fontWeight,fontStyle:style.title.fontStyle,color:style.title.color,fontFamily:style.font}}>{display.plotTitle}</div>}
-        <svg ref={svgRef} width={svgW} height={totalH} viewBox={"0 0 "+svgW+" "+totalH} style={{display:"block",cursor:legendDrag?"grabbing":"default",overflow:"visible"}}
+        <svg ref={svgRef} width={svgW} height={totalH} viewBox={"0 0 "+svgW+" "+totalH} style={{display:"block",width:"100%",maxWidth:svgW,height:"auto",cursor:legendDrag?"grabbing":"default",overflow:"visible"}}
           onPointerMove={onSvgPointerMove} onPointerUp={onSvgPointerUp} onPointerLeave={onSvgPointerUp}>
           {display.showGrid!==false&&yTicks.map((v,i)=><line key={"gy"+i} x1={ML} y1={scaleY(v)} x2={ML+innerW} y2={scaleY(v)} stroke={style.gridColor} strokeWidth={style.gridWidth} strokeDasharray="4 3"/>)}
           {display.showGrid!==false&&xTicks.map((v,i)=><line key={"gx"+i} x1={scaleX(v)} y1={MT} x2={scaleX(v)} y2={MT+PLOT_H} stroke={style.gridColor} strokeWidth={style.gridWidth} strokeDasharray="4 3"/>)}
@@ -1836,8 +1850,8 @@ function PCAScatter({samples, varExplained, stats, display, groupColors, legendV
               </g>
             );
           })()}
-          {yTicks.map((v,i)=><text key={"yt"+i} x={ML-6} y={scaleY(v)+4} textAnchor="end" fontSize={style.tick.fontSize} fill={style.tick.fill} fontFamily={style.font}>{v.toFixed(1)}</text>)}
-          {xTicks.map((v,i)=><text key={"xt"+i} x={scaleX(v)} y={MT+PLOT_H+16} textAnchor="middle" fontSize={style.tick.fontSize} fill={style.tick.fill} fontFamily={style.font}>{v.toFixed(1)}</text>)}
+          {yTicks.map((v,i)=><text key={"yt"+i} x={ML-6} y={scaleY(v)+4} textAnchor="end" fontSize={style.tick.fontSize} fill={style.tick.fill} fontFamily={style.font}>{v.toFixed(yTk.dec)}</text>)}
+          {xTicks.map((v,i)=><text key={"xt"+i} x={scaleX(v)} y={MT+PLOT_H+16} textAnchor="middle" fontSize={style.tick.fontSize} fill={style.tick.fill} fontFamily={style.font}>{v.toFixed(xTk.dec)}</text>)}
           <text x={ML+innerW/2} y={totalH-4} textAnchor="middle" fontSize={style.axis.fontSize} fontWeight={style.axis.fontWeight} fontStyle={style.axis.fontStyle} fill={style.axis.fill} fontFamily={style.font}>{xLabel}</text>
         <text x={12} y={MT+PLOT_H/2} textAnchor="middle" fontSize={style.axis.fontSize} fontWeight={style.axis.fontWeight} fontStyle={style.axis.fontStyle} fill={style.axis.fill} fontFamily={style.font} transform={"rotate(-90,12,"+(MT+PLOT_H/2)+")"}>{yLabel}</text>
         <line x1={ML} y1={scaleY(0)} x2={ML+innerW} y2={scaleY(0)} stroke={style.axisLineColor} strokeOpacity={0.3} strokeWidth={0.8}/>
@@ -2243,6 +2257,8 @@ export default function PCAPlotPage() {
               <div style={{flex:1,overflowY:"auto",padding:"16px 18px",minWidth:0}} ref={plotRef}>
                 {samples.length>0 ? (
                   <div style={{display:"flex",flexDirection:"column",gap:14,alignItems:"flex-start"}}>
+                    {/* Figure always on white paper with the light palette (see VolcanoPlot). */}
+                    <ThemeCtx.Provider value={LIGHT}>
                     <ErrorBoundary>
                       <PCAScatter samples={samples} varExplained={pcaResult.varExplained} stats={stats} display={display} groupColors={groupColors}
                         legendVisible={legendVisible} legendStyle={legendStyle} legendPos={legendPos} setLegendPos={setLegendPos}/>
@@ -2250,6 +2266,7 @@ export default function PCAPlotPage() {
                     <ErrorBoundary>
                       <ScreePlot varExplained={pcaResult.varExplained}/>
                     </ErrorBoundary>
+                    </ThemeCtx.Provider>
                   </div>
                 ) : (
                   <div style={{padding:"60px 20px",textAlign:"center",color:activeTheme.muted,fontSize:12}}>
