@@ -1,4 +1,8 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
+import { readProjectText } from "../shared/projectFile";
+import { parseLocaleNumber, guessHeaderRow } from "../shared/importUtils";
+import { loadXLSX, XLSX_FAIL_MSG } from "../shared/loadXLSX";
+import { encodeCanvas } from "../shared/exportUtils";
 import { ThemeCtx as TC, useTheme, LIGHT } from "../shared/theme";
 import CloudProjects from "../shared/CloudProjects";
 
@@ -353,16 +357,7 @@ function scanGeneNames(names) {
 
 // Local numeric parser. Handles thousands separators, and returns null rather
 // than 0 for unparseable input so a bad cell can't masquerade as a real value.
-function parseImportNumber(raw, delim) {
-  const s=String(raw).trim();
-  if (s==="") return null;
-  let cand=s;
-  if (delim !== "," && /^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) cand=s.replace(/,/g,"");
-  if (delim === ";" && /^-?\d+,\d+$/.test(s)) cand=s.replace(",","."); // European decimal comma
-  if (!/^-?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(cand)) return null;
-  const v=parseFloat(cand);
-  return isFinite(v) ? v : null;
-}
+const parseImportNumber = parseLocaleNumber;   /* shared/importUtils: NA, EU decimal comma incl. 1,1e-27 */
 
 // Header patterns for the field each tool needs. Ordered: first match wins.
 const FIELD_PATTERNS = {
@@ -416,8 +411,7 @@ function FileImportRows({fields, onImport, onClose}) {
   const applyRows=(rows,delim,fileName,extra)=>{
     if (!rows.length) { setError("That file didn't contain any readable rows."); return; }
     setParsed({rows, delim, fileName, ...(extra||{})});
-    setHeaderRow(0);
-    setMap(autoDetectFields(rows[0]||[], wanted));
+    { const hr=guessHeaderRow(rows); setHeaderRow(hr); setMap(autoDetectFields(rows[hr]||[], wanted)); }
     setError(null);
   };
 
@@ -426,9 +420,9 @@ function FileImportRows({fields, onImport, onClose}) {
     try {
       if (/\.(xlsx|xlsm|xls)$/i.test(file.name)) {
         let XLSX;
-        try { XLSX = await import(/* @vite-ignore */ "xlsx"); }
+        try { XLSX = await loadXLSX(); }
         catch(_) {
-          setError("Excel support needs the SheetJS library, which isn't installed. Install it from the SheetJS CDN (npm i --save https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz) — the copy on the npm registry is stale and unpatched. In the meantime, Save As → CSV in Excel works today.");
+          setError(XLSX_FAIL_MSG);
           setBusy(false); return;
         }
         const buf=await file.arrayBuffer();
@@ -453,8 +447,7 @@ function FileImportRows({fields, onImport, onClose}) {
     const rows=parsed.XLSX.utils.sheet_to_json(parsed.workbook.Sheets[name],{header:1,blankrows:false,raw:true})
                 .map(r=>r.map(c=>c===undefined||c===null?"":String(c)));
     setParsed(p=>({...p, rows, activeSheet:name}));
-    setHeaderRow(0);
-    setMap(autoDetectFields(rows[0]||[], wanted));
+    { const hr=guessHeaderRow(rows); setHeaderRow(hr); setMap(autoDetectFields(rows[hr]||[], wanted)); }
   };
 
   const built = useMemo(()=>{
@@ -516,7 +509,7 @@ function FileImportRows({fields, onImport, onClose}) {
           onClick={()=>inputRef.current&&inputRef.current.click()}
           style={{border:"2px dashed "+(drag?t.accent:t.cBorder), borderRadius:8, padding:"26px 16px", textAlign:"center", cursor:"pointer", background:drag?t.cSel:t.cBg}}>
           <div style={{fontSize:12, fontWeight:600, color:t.text, marginBottom:3}}>{busy?"Reading…":"Drop a results table here, or click to browse"}</div>
-          <div style={{fontSize:10.5, color:t.muted}}>DESeq2, edgeR or limma output · CSV, TSV, TXT · Excel .xlsx if SheetJS is installed</div>
+          <div style={{fontSize:10.5, color:t.muted}}>DESeq2, edgeR or limma output · CSV, TSV, TXT · Excel .xlsx</div>
         </div>
         <input ref={inputRef} type="file" accept=".csv,.tsv,.txt,.tab,.xlsx,.xlsm,.xls" style={{display:"none"}}
           onChange={e=>{const f=e.target.files[0];if(f)readFile(f);e.target.value="";}}/>
@@ -871,10 +864,7 @@ function LabelsPanel({sets, setSets, geneSet, setGeneSet, geneSetColor, setGeneS
     const csv=["gene,log2fc,"+adj+",nlp,group"]
       .concat(sigGenes.map(g=>g.gene+","+g.log2fc+","+g.pval+","+g.nlp+","+g.group))
       .join("\n");
-    const a=document.createElement("a");
-    a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-    a.download="significant_genes_"+new Date().toISOString().slice(0,10)+".csv";
-    a.click();
+    downloadBlob(new Blob([csv],{type:"text/csv;charset=utf-8"}), "significant_genes_"+new Date().toISOString().slice(0,10)+".csv"); /* blob download: data: URLs fail silently past ~2MB / in Firefox */
   };
 
   return (
@@ -1482,19 +1472,7 @@ function encodeTIFF(imageData, dpi) {
 
 // Encode a canvas for download in the requested format, with correct DPI
 // metadata baked in for every raster format.
-function encodeCanvas(canvas, format, dpi) {
-  if (format === "tiff") {
-    const ctx = canvas.getContext("2d");
-    const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    return Promise.resolve(new Blob([encodeTIFF(data, dpi)], {type:"image/tiff"}));
-  }
-  const mime = format === "jpeg" ? "image/jpeg" : "image/png";
-  return canvasToBlob(canvas, mime, 0.95).then(blob=>{
-    if (format !== "png") return blob;
-    return blob.arrayBuffer().then(ab=>new Blob([pngWithDPI(ab, dpi)], {type:"image/png"}))
-                             .catch(()=>blob);   // metadata is a bonus, never a blocker
-  });
-}
+/* encodeCanvas: shared/exportUtils (adds JPEG DPI) */
 
 function ExportPanel({plotRef, d, rows}) {
   const C=useC();
@@ -1717,7 +1695,7 @@ function SheetSidebar({sheets, activeId, onSelect, onNew, onRename, onDuplicate,
         <button onClick={onSave} style={{width:"100%", padding:"7px 0", borderRadius:6, fontSize:11, fontWeight:600, cursor:"pointer", background:C.success, border:"none", color:"#fff"}}>Save Project</button>
         <button onClick={()=>fileRef.current&&fileRef.current.click()} style={{width:"100%", padding:"7px 0", borderRadius:6, fontSize:11, cursor:"pointer", background:"transparent", border:"1px solid "+C.border, color:C.muted}}>Load Project</button>
         <input ref={fileRef} type="file" accept=".json" style={{display:"none"}}
-          onChange={e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>{try{onLoad(JSON.parse(ev.target.result));}catch(_){}};r.readAsText(f);e.target.value="";}}/>
+          onChange={e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>readProjectText(ev.target.result,"volcano-plot",onLoad);r.readAsText(f);e.target.value="";}}/>
         <div style={{fontSize:9, color:C.muted, textAlign:"center"}}>Ctrl+S to save</div>
       </div>
     </div>
@@ -2230,7 +2208,7 @@ export default function VolcanoPlotPage() {
   const renameSheet=(id,name)=>setSheets(ss=>ss.map(s=>s.id===id?{...s,name}:s));
   const dupSheet=id=>{const src=sheets.find(s=>s.id===id);if(!src)return;const sh={...JSON.parse(JSON.stringify(src)),id:Date.now()+Math.random(),name:src.name+" (copy)"};histMap.current[sh.id]=[sh.rows];curMap.current[sh.id]=0;setSheets(ss=>[...ss,sh]);setActiveId(sh.id);};
   const delSheet=id=>{if(sheets.length<=1)return;const rem=sheets.filter(s=>s.id!==id);setSheets(rem);if(activeId===id)setActiveId(rem[rem.length-1].id);};
-  const saveProject=useCallback(()=>{const a=document.createElement("a");a.href="data:application/json;charset=utf-8,"+encodeURIComponent(JSON.stringify({version:2,sheets},null,2));a.download="volcano_project_"+new Date().toISOString().slice(0,10)+".json";a.click();},[sheets]);
+  const saveProject=useCallback(()=>{downloadBlob(new Blob([JSON.stringify({version:2,tool:"volcano-plot",sheets},null,2)],{type:"application/json;charset=utf-8"}), "volcano_project_"+new Date().toISOString().slice(0,10)+".json"); /* blob download: data: URLs fail silently past ~2MB / in Firefox */},[sheets]);
   const loadProject=data=>{if(!data||!data.sheets||!data.sheets.length)return;setSheets(data.sheets);setActiveId(data.sheets[0].id);data.sheets.forEach(s=>{histMap.current[s.id]=[s.rows];curMap.current[s.id]=0;});bump(v=>v+1);};
   useEffect(()=>{const h=e=>{if((e.ctrlKey||e.metaKey)&&!e.shiftKey&&e.key==="z"){e.preventDefault();undo();}if((e.ctrlKey||e.metaKey)&&(e.key==="y"||(e.shiftKey&&e.key==="z"))){e.preventDefault();redo();}if((e.ctrlKey||e.metaKey)&&e.key==="s"){e.preventDefault();saveProject();}};window.addEventListener("keydown",h);return()=>window.removeEventListener("keydown",h);},[undo,redo,saveProject]);
   const {rows,d,sets,geneSet,geneSetColor}=active;

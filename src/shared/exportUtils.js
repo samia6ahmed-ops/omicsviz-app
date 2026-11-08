@@ -266,6 +266,18 @@ function encodeTIFF(imageData, dpi) {
   return buf;
 }
 
+// Write DPI into a JPEG's JFIF APP0 header (units=1 → dots per inch). Browsers
+// emit density 1×1 with no units, which Word/journals read as 72 or 96 dpi.
+function jpegWithDPI(arrayBuffer, dpi) {
+  const b = new Uint8Array(arrayBuffer.slice(0));
+  const isJFIF = b[0]===0xFF && b[1]===0xD8 && b[2]===0xFF && b[3]===0xE0 &&
+    b[6]===0x4A && b[7]===0x46 && b[8]===0x49 && b[9]===0x46 && b[10]===0;
+  if (!isJFIF) return b;
+  const d = Math.max(1, Math.min(65535, Math.round(dpi)));
+  b[13] = 1; b[14] = d>>8; b[15] = d&255; b[16] = d>>8; b[17] = d&255;
+  return b;
+}
+
 // Encode a canvas for download in the requested format, with correct DPI
 // metadata baked in for every raster format.
 function encodeCanvas(canvas, format, dpi) {
@@ -276,10 +288,11 @@ function encodeCanvas(canvas, format, dpi) {
   }
   const mime = format === "jpeg" ? "image/jpeg" : "image/png";
   return canvasToBlob(canvas, mime, 0.95).then(blob=>{
-    if (format !== "png") return blob;
+    if (format === "jpeg")
+      return blob.arrayBuffer().then(ab=>new Blob([jpegWithDPI(ab, dpi)], {type:"image/jpeg"})).catch(()=>blob);
     return blob.arrayBuffer().then(ab=>new Blob([pngWithDPI(ab, dpi)], {type:"image/png"}))
                              .catch(()=>blob);   // metadata is a bonus, never a blocker
   });
 }
 
-export { downloadURL, downloadBlob, prepareSVGForExport, serializeSVG, rasterizeSVG, canvasToBlob, encodeTIFF, pngWithDPI, encodeCanvas };
+export { downloadURL, downloadBlob, prepareSVGForExport, serializeSVG, rasterizeSVG, canvasToBlob, encodeTIFF, pngWithDPI, jpegWithDPI, encodeCanvas };

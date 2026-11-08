@@ -1,5 +1,11 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
+import { readProjectText } from "../shared/projectFile";
+import { rowsToMatrixClean, guessHeaderRow } from "../shared/importUtils";
+import { loadXLSX, XLSX_FAIL_MSG } from "../shared/loadXLSX";
+import { encodeCanvas } from "../shared/exportUtils";
 import { ThemeCtx, useTheme, LIGHT } from "../shared/theme";
+import { withDefaultGroups } from "../shared/inferGroups";
+import AutoGroupButton from "../shared/AutoGroupButton";
 import CloudProjects from "../shared/CloudProjects";
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -342,6 +348,7 @@ const DEFAULT_STATS = {
   maskNonSignificant:false,   // fade cells with p >= alphaThreshold
   alphaThreshold:0.05,
   triangle:"full",            // "full" | "upper" | "lower"
+  colorRange:"full",          // "full" = fixed -1..1 | "fit" = min off-diagonal r .. 1
 };
 
 // ─── Sheet model ────────────────────────────────────────────────────────────
@@ -384,6 +391,18 @@ function ColorSwatch({color, size=20, onChange}) {
     </div>
   );
 }
+// Crop the export to what is actually drawn (plus a small pad). Without it the
+// heatmap SVG's fixed canvas left ~10% blank margin on the right and bottom.
+function tightViewBox(svgEl, fallbackW, fallbackH, pad) {
+  const full = {x:0, y:0, w:fallbackW, h:fallbackH};
+  if (!svgEl || typeof svgEl.getBBox !== "function") return full;
+  try {
+    const bb = svgEl.getBBox();
+    if (!bb || !(bb.width > 1) || !(bb.height > 1)) return full;
+    return {x: bb.x-pad, y: bb.y-pad, w: bb.width+pad*2, h: bb.height+pad*2};
+  } catch (_) { return full; }
+}
+
 function Toggle({value, onChange, label}) {
   const t=useTheme();
   return (
@@ -485,26 +504,9 @@ function scanGeneNames(names) {
   return {dates, sci, dupes:[...new Set(dupes)]};
 }
 
-// rows -> matrix, taking row 0 as sample headers and column 0 as gene IDs.
-function rowsToMatrix(rows, delim, headerRow, idCol) {
-  const hdr=rows[headerRow]||[];
-  const sampleNames=hdr.slice(idCol+1).map((h,i)=>h.trim()||("Sample"+(i+1)));
-  const geneNames=[], values=[];
-  let badCells=0;
-  for (let r=headerRow+1;r<rows.length;r++) {
-    const row=rows[r];
-    if (!row || row.every(c=>c.trim()==="")) continue;
-    geneNames.push((row[idCol]||"").trim());
-    const vals=[];
-    for (let c=0;c<sampleNames.length;c++) {
-      const cell=parseNumericCell(row[idCol+1+c]!==undefined?row[idCol+1+c]:"", delim);
-      if (cell.bad) badCells++;
-      vals.push(cell.value);
-    }
-    values.push(vals);
-  }
-  return {sampleNames, geneNames, values, badCells};
-}
+// rows -> matrix: see shared/importUtils (skips annotation columns, drops genes
+// with missing values instead of filling them with 0, cleans BAM-path headers).
+const rowsToMatrix = rowsToMatrixClean;
 
 function FileImport({onImport, onClose}) {
   const t=useTheme();
@@ -520,7 +522,7 @@ function FileImport({onImport, onClose}) {
   const ingestRows=(rows,delim,fileName,extra)=>{
     if (!rows.length) { setError("That file didn't contain any readable rows."); return; }
     setParsed({rows, delim, fileName, ...(extra||{})});
-    setHeaderRow(0); setIdCol(0); setError(null);
+    setHeaderRow(guessHeaderRow(rows)); setIdCol(0); setError(null);
   };
 
   const readFile = async file => {
@@ -529,9 +531,9 @@ function FileImport({onImport, onClose}) {
       const isXlsx=/\.(xlsx|xlsm|xls)$/i.test(file.name);
       if (isXlsx) {
         let XLSX;
-        try { XLSX = await import(/* @vite-ignore */ "xlsx"); }
+        try { XLSX = await loadXLSX(); }
         catch(_) {
-          setError("Excel support needs the SheetJS library, which isn't installed. Install it from the SheetJS CDN (npm i --save https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz) — the copy on the npm registry is stale and unpatched. In the meantime, Save As → CSV in Excel works today.");
+          setError(XLSX_FAIL_MSG);
           setBusy(false); return;
         }
         const buf=await file.arrayBuffer();
@@ -556,7 +558,7 @@ function FileImport({onImport, onClose}) {
     const rows=parsed.XLSX.utils.sheet_to_json(parsed.workbook.Sheets[name],{header:1,blankrows:false,raw:true})
                 .map(r=>r.map(c=>c===undefined||c===null?"":String(c)));
     setParsed(p=>({...p, rows, activeSheet:name}));
-    setHeaderRow(0); setIdCol(0);
+    setHeaderRow(guessHeaderRow(rows)); setIdCol(0);
   };
 
   const built = useMemo(()=>{
@@ -570,7 +572,8 @@ function FileImport({onImport, onClose}) {
     let geneNames=[...built.geneNames];
     if (repair) built.scan.dates.forEach(d=>{ if(d.suggested) geneNames[d.i]=d.suggested; });
     const warnings=[];
-    if (built.badCells>0) warnings.push(built.badCells+" cell(s) weren't numeric and were set to 0.");
+    if (built.droppedRows>0) warnings.push(built.droppedRows+" gene(s) with missing or non-numeric values (NA, blank, text) were left out.");
+    if (built.skippedCols && built.skippedCols.length) warnings.push("Skipped non-sample column(s): "+built.skippedCols.slice(0,6).join(", ")+(built.skippedCols.length>6?"…":"")+".");
     const unrepaired=built.scan.dates.filter(d=>!d.suggested||!repair).length;
     if (unrepaired>0) warnings.push(unrepaired+" gene name(s) still look like dates — check them against your source file.");
     if (built.scan.sci.length>0) warnings.push(built.scan.sci.length+" gene ID(s) look like Excel turned them into scientific notation (e.g. 2310009E13). These can't be recovered automatically.");
@@ -594,7 +597,7 @@ function FileImport({onImport, onClose}) {
           onClick={()=>inputRef.current&&inputRef.current.click()}
           style={{border:"2px dashed "+(drag?t.accent:t.cBorder), borderRadius:8, padding:"26px 16px", textAlign:"center", cursor:"pointer", background:drag?t.cSel:t.cBg}}>
           <div style={{fontSize:12, fontWeight:600, color:t.text, marginBottom:3}}>{busy?"Reading…":"Drop a file here, or click to browse"}</div>
-          <div style={{fontSize:10.5, color:t.muted}}>CSV, TSV, or TXT · Excel .xlsx if SheetJS is installed</div>
+          <div style={{fontSize:10.5, color:t.muted}}>CSV, TSV, or TXT · Excel .xlsx</div>
         </div>
         <input ref={inputRef} type="file" accept=".csv,.tsv,.txt,.tab,.xlsx,.xlsm,.xls" style={{display:"none"}}
           onChange={e=>{const f=e.target.files[0];if(f)readFile(f);e.target.value="";}}/>
@@ -696,9 +699,10 @@ function FileImport({onImport, onClose}) {
         </div>
       )}
 
-      {built.badCells>0&&(
-        <div style={{fontSize:11, padding:"8px 10px", borderRadius:6, marginBottom:9, background:t.tag, color:t.tagText, border:"1px solid "+t.cBorder}}>
-          {built.badCells} non-numeric cell{built.badCells!==1?"s":""} will import as 0.
+      {(built.droppedRows>0||built.skippedCols.length>0)&&(
+        <div style={{fontSize:11, lineHeight:1.6, padding:"8px 10px", borderRadius:6, marginBottom:9, background:t.tag, color:t.tagText, border:"1px solid "+t.cBorder}}>
+          {built.droppedRows>0&&<div>{built.droppedRows} gene{built.droppedRows!==1?"s":""} with missing values (NA, blank or text) will be left out.</div>}
+          {built.skippedCols.length>0&&<div>Skipping non-sample column{built.skippedCols.length!==1?"s":""}: {built.skippedCols.slice(0,6).join(", ")}{built.skippedCols.length>6?"…":""}</div>}
         </div>
       )}
 
@@ -1046,6 +1050,7 @@ function SampleGroupsPanel({sampleNames, sampleGroups, setSampleGroups, groupCol
       <div style={{fontSize:11, color:t.muted, marginBottom:10, lineHeight:1.5}}>
         Drives the annotation strips along both axes of the correlation heatmap.
       </div>
+      <AutoGroupButton sampleNames={sampleNames} setSampleGroups={setSampleGroups}/>
       <div style={{border:"1px solid "+t.border, borderRadius:8, overflow:"hidden", marginBottom:14}}>
         {sampleNames.map((s,i)=>{
           const current = sampleGroups[s]||"Group 1";
@@ -1165,6 +1170,13 @@ function CorrelationPanel({stats, setStats, nSamplesTotal, nGenesTotal, unmatche
           </button>
         ))}
       </div>
+
+      <div style={{fontSize:10, color:t.muted, marginBottom:5}}>Color range</div>
+      <div style={{display:"flex", gap:5, marginBottom:6}}>
+        <Pill active={stats.colorRange!=="fit"} onClick={()=>setStats(s=>({...s,colorRange:"full"}))}>−1 to 1</Pill>
+        <Pill active={stats.colorRange==="fit"} onClick={()=>setStats(s=>({...s,colorRange:"fit"}))}>Fit to data</Pill>
+      </div>
+      <div style={{fontSize:10, color:t.muted, lineHeight:1.5, marginBottom:4}}>Sample correlations often all fall between 0.9 and 1 — "Fit to data" stretches the colors across that range so replicate structure shows.</div>
 
       <Divider/>
       <SectionLabel>Cell Values</SectionLabel>
@@ -1507,25 +1519,14 @@ function encodeTIFF(imageData, dpi) {
 
 // Encode a canvas for download in the requested format, with correct DPI
 // metadata baked in for every raster format.
-function encodeCanvas(canvas, format, dpi) {
-  if (format === "tiff") {
-    const ctx = canvas.getContext("2d");
-    const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    return Promise.resolve(new Blob([encodeTIFF(data, dpi)], {type:"image/tiff"}));
-  }
-  const mime = format === "jpeg" ? "image/jpeg" : "image/png";
-  return canvasToBlob(canvas, mime, 0.95).then(blob=>{
-    if (format !== "png") return blob;
-    return blob.arrayBuffer().then(ab=>new Blob([pngWithDPI(ab, dpi)], {type:"image/png"}))
-                             .catch(()=>blob);   // metadata is a bonus, never a blocker
-  });
-}
+/* encodeCanvas: shared/exportUtils (adds JPEG DPI) */
 
 function ExportPanel({plotRef, display, labels, corrMatrix, pMatrix, method}) {
   const t=useTheme();
   const [format,setFormat]=useState("png");
   const [dpi,setDpi]=useState(300);
   const [saving,setSaving]=useState(false);
+  const [trim,setTrim]=useState(true);
   const [done,setDone]=useState(false);
   const [err,setErr]=useState(null);
 
@@ -1542,9 +1543,7 @@ function ExportPanel({plotRef, display, labels, corrMatrix, pMatrix, method}) {
         const pHeader = ","+labels.join(",");
         const pRows = labels.map((lb,i)=>lb+","+(pMatrix&&pMatrix[i]?pMatrix[i].map(v=>v.toExponential(4)).join(","):labels.map(()=>"").join(",")));
         const csv = [rLabel+" matrix", rHeader, ...rRows, "", "p-value matrix", pHeader, ...pRows].join("\n");
-        const a=document.createElement("a");
-        a.href="data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-        a.download=name+".csv"; a.click();
+        downloadBlob(new Blob([csv],{type:"text/csv;charset=utf-8"}), name+".csv"); // blob + attached anchor (was a detached data: link)
         setDone(true); setTimeout(()=>setDone(false),1500);
         return;
       }
@@ -1553,10 +1552,13 @@ function ExportPanel({plotRef, display, labels, corrMatrix, pMatrix, method}) {
       const clone=svgEl.cloneNode(true);
       clone.setAttribute("xmlns","http://www.w3.org/2000/svg");
       const vb=(svgEl.getAttribute("viewBox")||"0 0 700 420").split(" ").map(Number);
-      const svgW=vb[2]||700, svgH=vb[3]||420;
+      const box=trim?tightViewBox(svgEl,vb[2]||700,vb[3]||420,6):{x:0,y:0,w:vb[2]||700,h:vb[3]||420};
+      const svgW=box.w, svgH=box.h;
+      clone.setAttribute("viewBox",box.x+" "+box.y+" "+box.w+" "+box.h);
       const bgFill="#ffffff"; // figures are always on white paper
       const bgRect=document.createElementNS("http://www.w3.org/2000/svg","rect");
-      bgRect.setAttribute("width","100%"); bgRect.setAttribute("height","100%"); bgRect.setAttribute("fill",bgFill);
+      bgRect.setAttribute("x",box.x); bgRect.setAttribute("y",box.y);
+      bgRect.setAttribute("width",box.w); bgRect.setAttribute("height",box.h); bgRect.setAttribute("fill",bgFill);
       clone.insertBefore(bgRect,clone.firstChild);
       if(format==="svg"){
         clone.setAttribute("width",svgW); clone.setAttribute("height",svgH);
@@ -1594,6 +1596,8 @@ function ExportPanel({plotRef, display, labels, corrMatrix, pMatrix, method}) {
       {format!=="svg"&&format!=="csv"&&(
         <div>
           <Divider/>
+          <Toggle value={trim} onChange={setTrim} label="Trim empty space"/>
+          <div style={{fontSize:10, color:t.muted, lineHeight:1.5, margin:"2px 0 10px"}}>Crops the exported file to the heatmap itself. Leave on unless you want the blank margin kept.</div>
           <SectionLabel>Resolution (DPI)</SectionLabel>
           <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:4, marginBottom:6}}>
             {[[72,"Screen"],[150,"Draft"],[300,"Journal"],[600,"High-res"]].map(([v,lb])=>(
@@ -1640,8 +1644,9 @@ const COLOR_BUCKETS  = 192;   // quantisation steps for merged-path rendering
 // so export quality is unchanged, but 250x250 drops from 62,500 elements to at
 // most a couple of hundred. 192 buckets is finer than the eye resolves on a
 // diverging scale, so the gradient still reads as continuous.
-function bucketOf(r) {
-  const t01 = (r + 1) / 2;
+// lo/hi = the r values mapped to the two ends of the colour scale.
+function bucketOf(r, lo = -1, hi = 1) {
+  const t01 = (r - lo) / (hi - lo);
   const b = Math.round(t01 * (COLOR_BUCKETS - 1));
   return b < 0 ? 0 : b > COLOR_BUCKETS-1 ? COLOR_BUCKETS-1 : b;
 }
@@ -1714,6 +1719,20 @@ function CorrHeatmap({labels, corrMatrix, pMatrix, display, stats, itemGroups, g
     return out;
   },[order,labels,corrMatrix,pMatrix,stats.triangle]);
 
+  // Colour range. Sample-to-sample correlations usually all sit in 0.9–1.0,
+  // so on a fixed -1..1 scale every cell is the same red and replicate
+  // structure is invisible; "fit" stretches the scale to the data instead.
+  const range = useMemo(()=>{
+    if (stats.colorRange!=="fit") return {lo:-1, hi:1, fit:false};
+    let mn=Infinity, mx=-Infinity;
+    for (const c of cells) { if (c.ri===c.ci || !isFinite(c.r)) continue; if (c.r<mn) mn=c.r; if (c.r>mx) mx=c.r; }
+    if (!isFinite(mn)) return {lo:-1, hi:1, fit:false};
+    // Scale spans the off-diagonal values; the diagonal (always 1) simply
+    // clamps to the top colour instead of eating the range.
+    const lo = Math.floor(mn*100)/100, hi = Math.min(1, Math.ceil(mx*100)/100);
+    return hi-lo < 0.005 ? {lo:-1, hi:1, fit:false} : {lo, hi, fit:true};
+  },[cells, stats.colorRange]);
+
   // Group cells into colour buckets once, then emit one path per bucket.
   const cellLayers = useMemo(()=>{
     const groups = new Map();
@@ -1721,15 +1740,15 @@ function CorrHeatmap({labels, corrMatrix, pMatrix, display, stats, itemGroups, g
       const c = cells[i];
       const isDiagonal = c.ri===c.ci;
       const masked = stats.maskNonSignificant && !isDiagonal && c.p!==null && c.p>=stats.alphaThreshold;
-      const key = bucketOf(c.r) + (masked ? "m" : "");
+      const key = bucketOf(c.r, range.lo, range.hi) + (masked ? "m" : "");
       let g = groups.get(key);
-      if (!g) { g = {css: interpColor(stats.colorScale, (bucketOf(c.r)/(COLOR_BUCKETS-1))).css, masked, cells:[]}; groups.set(key, g); }
+      if (!g) { g = {css: interpColor(stats.colorScale, (bucketOf(c.r, range.lo, range.hi)/(COLOR_BUCKETS-1))).css, masked, cells:[]}; groups.set(key, g); }
       g.cells.push(c);
     }
     const out = [];
     groups.forEach(g=>out.push({css:g.css, masked:g.masked, d:rectPath(g.cells, cell, ML, MT)}));
     return out;
-  },[cells, stats.colorScale, stats.maskNonSignificant, stats.alphaThreshold, cell, ML, MT]);
+  },[cells, stats.colorScale, stats.maskNonSignificant, stats.alphaThreshold, cell, ML, MT, range]);
 
   const maskedCells = useMemo(()=>{
     if (!stats.maskNonSignificant) return [];
@@ -1801,7 +1820,7 @@ function CorrHeatmap({labels, corrMatrix, pMatrix, display, stats, itemGroups, g
           const isDiagonal = c.ri===c.ci;
           const masked = stats.maskNonSignificant && !isDiagonal && c.p!==null && c.p>=stats.alphaThreshold;
           if (masked) return null;
-          const {rgb} = interpColor(stats.colorScale, (c.r+1)/2);
+          const {rgb} = interpColor(stats.colorScale, (c.r-range.lo)/(range.hi-range.lo));
           return (
             <text key={"v"+i} x={ML+c.pj*cell+cell/2} y={MT+c.pi*cell+cell/2+display.cellValueSize*0.35}
               fontSize={display.cellValueSize} fontFamily={display.ff} textAnchor="middle"
@@ -1851,9 +1870,9 @@ function CorrHeatmap({labels, corrMatrix, pMatrix, display, stats, itemGroups, g
             </linearGradient>
           </defs>
           <rect x={0} y={8} width={16} height={90} fill="url(#corrLegendGrad)" stroke={t.border} strokeWidth={0.5}/>
-          <text x={20} y={16} fontSize={9} fill={t.muted} fontFamily={display.ff}>1.0</text>
-          <text x={20} y={56} fontSize={9} fill={t.muted} fontFamily={display.ff}>0.0</text>
-          <text x={20} y={96} fontSize={9} fill={t.muted} fontFamily={display.ff}>-1.0</text>
+          <text x={20} y={16} fontSize={9} fill={t.muted} fontFamily={display.ff}>{range.hi.toFixed(range.fit?2:1)}</text>
+          <text x={20} y={56} fontSize={9} fill={t.muted} fontFamily={display.ff}>{((range.lo+range.hi)/2).toFixed(range.fit?2:1)}</text>
+          <text x={20} y={96} fontSize={9} fill={t.muted} fontFamily={display.ff}>{range.lo.toFixed(range.fit?2:1)}</text>
 
           {hasGroups && (
             <g transform="translate(0,120)">
@@ -1999,7 +2018,7 @@ function SheetSidebar({sheets, activeId, onSelect, onNew, onRename, onDuplicate,
         <button onClick={onSave} style={{width:"100%", padding:"7px 0", borderRadius:6, fontSize:11, fontWeight:600, cursor:"pointer", background:t.success, border:"none", color:"#fff"}}>Save Project</button>
         <button onClick={()=>fileRef.current&&fileRef.current.click()} style={{width:"100%", padding:"7px 0", borderRadius:6, fontSize:11, cursor:"pointer", background:"transparent", border:"1px solid "+t.border, color:t.muted}}>Load Project</button>
         <input ref={fileRef} type="file" accept=".json" style={{display:"none"}}
-          onChange={e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>{try{onLoad(JSON.parse(ev.target.result));}catch(_){}};r.readAsText(f);e.target.value="";}}/>
+          onChange={e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>readProjectText(ev.target.result,"correlation-heatmap",onLoad);r.readAsText(f);e.target.value="";}}/>
         <div style={{fontSize:9, color:t.muted, textAlign:"center"}}>Ctrl+S to save</div>
       </div>
     </div>
@@ -2093,10 +2112,7 @@ export default function CorrelationHeatmapPage() {
 
   // ── Save / load: one file holds every sheet ──────────────────────────────
   const saveProject = useCallback(()=>{
-    const a=document.createElement("a");
-    a.href="data:application/json;charset=utf-8,"+encodeURIComponent(JSON.stringify({version:2, tool:"correlation-heatmap", sheets},null,2));
-    a.download="correlation_heatmap_project_"+new Date().toISOString().slice(0,10)+".json";
-    a.click();
+    downloadBlob(new Blob([JSON.stringify({version:2, tool:"correlation-heatmap", sheets},null,2)],{type:"application/json;charset=utf-8"}), "correlation_heatmap_project_"+new Date().toISOString().slice(0,10)+".json"); /* blob download: data: URLs fail silently past ~2MB / in Firefox */
   },[sheets]);
 
   const loadProject = data => {
@@ -2132,11 +2148,9 @@ export default function CorrelationHeatmapPage() {
 
   useEffect(()=>{
     if (!matrix.sampleNames.length) return;
-    setSampleGroups(prev=>{
-      const next={...prev}; let changed=false;
-      matrix.sampleNames.forEach(s=>{ if(!next[s]){ next[s]="Group 1"; changed=true; } });
-      return changed?next:prev;
-    });
+    // New samples get a group guessed from their names (Ctrl_1 -> "Ctrl")
+    // when nothing has been assigned yet; otherwise the default "Group 1".
+    setSampleGroups(prev=>withDefaultGroups(prev, matrix.sampleNames));
   },[matrix.sampleNames, setSampleGroups]);
 
   useEffect(()=>{

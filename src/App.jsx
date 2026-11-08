@@ -1,8 +1,10 @@
 import { lazy, Suspense } from "react";
-import { BrowserRouter, Routes, Route, Navigate } from "react-router-dom";
+import { BrowserRouter, Routes, Route, Navigate, Link } from "react-router-dom";
 import { AuthProvider } from "./shared/AuthContext";
 import AppShell from "./shared/AppShell";
 import About from "./routes/About";
+import Contact from "./routes/Contact";
+import Methods from "./routes/Methods";
 import TranscriptomicsHome from "./routes/TranscriptomicsHome";
 import UnderConstruction from "./routes/UnderConstruction";
 import ToolPlaceholder from "./routes/ToolPlaceholder";
@@ -29,6 +31,16 @@ const TOOL_COMPONENTS = {
   figures: FigureLayout,
 };
 
+function NotFound() {
+  return (
+    <div style={{ padding: "48px 24px", maxWidth: 520 }}>
+      <div style={{ fontSize: 13, fontWeight: 700, opacity: 0.55, letterSpacing: ".06em" }}>404</div>
+      <h1 style={{ fontSize: 26, margin: "6px 0 10px" }}>Page not found</h1>
+      <p style={{ fontSize: 14, lineHeight: 1.6, opacity: 0.8 }}>That address doesn't match any page. Pick a tool from the menu, or go to the <Link to="/transcriptomics">Transcriptomics tools</Link>.</p>
+    </div>
+  );
+}
+
 export default function App() {
   return (
     <AuthProvider>
@@ -37,6 +49,9 @@ export default function App() {
           <Route element={<AppShell />}>
             <Route path="/" element={<Navigate to="/about" replace />} />
             <Route path="/about" element={<About />} />
+            <Route path="/tutorials" element={<Navigate to="/about" replace />} />
+            <Route path="/contact" element={<Contact />} />
+            <Route path="/methods" element={<Methods />} />
 
             {/* Transcriptomics: index page + one route per tool */}
             <Route path="/transcriptomics" element={<TranscriptomicsHome />} />
@@ -59,6 +74,7 @@ export default function App() {
             {UMBRELLAS.filter((u) => u.status === "construction").map((u) => (
               <Route key={u.id} path={u.path} element={<UnderConstruction umbrella={u} />} />
             ))}
+            <Route path="*" element={<NotFound />} />
           </Route>
         </Routes>
       </BrowserRouter>

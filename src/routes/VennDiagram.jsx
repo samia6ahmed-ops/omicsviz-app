@@ -1,4 +1,7 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
+import { readProjectText } from "../shared/projectFile";
+import { loadXLSX, XLSX_FAIL_MSG } from "../shared/loadXLSX";
+import { encodeCanvas } from "../shared/exportUtils";
 import { ThemeCtx as TC, useTheme, LIGHT } from "../shared/theme";
 import CloudProjects from "../shared/CloudProjects";
 
@@ -188,17 +191,30 @@ function computeVennLabelPositions(ellipses, W, H, step) {
   return out;
 }
 
-// Set-name anchors: pushed outward from the diagram centre along the direction
-// of the region belonging to that set alone, so names sit beside their own lobe.
-function computeSetLabelPositions(ellipses, labelPos, W, H) {
+// Set-name placement. The old rule ("push 22% further out than the set's own
+// region") left names sitting on the lobe edge next to its count. Instead walk outward
+// from the diagram centre through the set's own region until the point is
+// outside every ellipse, then place the name just beyond it (anchored away
+// from the diagram) and keep it inside the padded canvas.
+function computeOuterSetLabels(ellipses, labelPos, W, H, names, fs, padX, padY) {
+  const cx = W/2, cy = H/2, maxT = Math.hypot(W, H);
   return ellipses.map((e,i)=>{
     const own = labelPos[1<<i];
-    const cx = W/2, cy = H/2;
-    const ax = own ? own.x : e.cx, ay = own ? own.y : e.cy;
-    const dx = ax-cx, dy = ay-cy;
-    const len = Math.max(1, Math.hypot(dx,dy));
-    const push = ellipses.length<=2 ? 1.35 : ellipses.length===3 ? 1.30 : 1.22;
-    return { x: cx + dx/len*len*push, y: cy + dy/len*len*push };
+    let dx = (own ? own.x : e.cx) - cx, dy = (own ? own.y : e.cy) - cy;
+    const len = Math.hypot(dx, dy) || 1; dx /= len; dy /= len;
+    let t = len;
+    while (t < maxT && ellipses.some(E=>pointInEllipse(cx+dx*t, cy+dy*t, E))) t += 2;
+    t += fs*0.6;
+    let x = cx + dx*t, y = cy + dy*t;
+    const anchor = Math.abs(dx) < 0.4 ? "middle" : dx > 0 ? "start" : "end";
+    if (anchor === "middle") y += dy > 0 ? fs*0.9 : -fs*0.2; else y += fs*0.35;
+    const w = String((names && names[i]) || "").length * fs * 0.6;
+    const L = -padX + 4, R = W + padX - 4;
+    if (anchor === "start") x = Math.min(x, R - w);
+    else if (anchor === "end") x = Math.max(x, L + w);
+    else x = Math.max(L + w/2, Math.min(R - w/2, x));
+    y = Math.max(-padY + fs, Math.min(H + padY - 4, y));
+    return { x, y, anchor };
   });
 }
 
@@ -274,7 +290,7 @@ function Sheet({lists, setLists}) {
   return (
     <div>
       <div style={{display:"flex", alignItems:"center", gap:6, marginBottom:10, flexWrap:"wrap"}}>
-        <button onClick={()=>setLists(EXAMPLE_SETS.map(s=>({...s})))} style={{padding:"5px 14px", borderRadius:7, fontSize:12, fontWeight:600, cursor:"pointer", background:C.accent, border:"none", color:"#fff"}}>Load example data</button>
+        {/* "Load example data" lives in the toolbar above; it used to appear twice. */}
         <span style={{marginLeft:"auto", fontSize:11, color:C.muted, fontWeight:500}}>{lists.length} sets</span>
       </div>
 
@@ -322,9 +338,11 @@ function gS(d, C) {
 }
 
 // ─── Style Panel ─────────────────────────────────────────────────────────────────
-function PlotPanel({d, set, nSets}) {
+// effectiveMode comes from the tool itself so the panel can never disagree with
+// what is drawn (it used an old "Venn only up to 3 sets" rule while the plot
+// draws Venns up to MAX_VENN_SETS).
+function PlotPanel({d, set, nSets, effectiveMode}) {
   const C=useC();
-  const effectiveMode = d.mode==="auto" ? (nSets<=3?"venn":"upset") : (d.mode==="venn" && nSets>3 ? "upset" : d.mode);
   return (
     <div>
       <SLabel>Figure Title</SLabel>
@@ -340,12 +358,12 @@ function PlotPanel({d, set, nSets}) {
       <div style={{padding:"7px 9px", borderRadius:6, background:C.panel2, border:"1px solid "+C.border, fontSize:10, color:C.muted, marginBottom:6}}>
         Currently showing: <span style={{color:C.text, fontWeight:700}}>{effectiveMode==="venn"?"Venn diagram":"UpSet plot"}</span>
       </div>
-      {nSets>3 && d.mode==="venn" && (
+      {nSets>MAX_VENN_SETS && d.mode==="venn" && (
         <div style={{fontSize:9, color:C.warn, padding:"6px 9px", borderRadius:6, background:"rgba(217,119,6,0.08)", border:"1px solid rgba(217,119,6,0.2)", marginBottom:6, lineHeight:1.5}}>
-          Venn diagrams beyond 3 sets become geometrically unreadable / misleading — showing UpSet instead. This matches standard visualization guidance (Lex et al. 2014).
+          No arrangement of ellipses can show every intersection beyond {MAX_VENN_SETS} sets — showing UpSet instead, the standard for many-set comparisons (Lex et al. 2014).
         </div>
       )}
-      <div style={{fontSize:9, color:C.muted, marginBottom:10, lineHeight:1.5}}>Auto: Venn for 2-3 sets, UpSet for 4+. UpSet plot works for any number of sets and shows exact intersection sizes, sorted by size.</div>
+      <div style={{fontSize:9, color:C.muted, marginBottom:10, lineHeight:1.5}}>Auto: Venn for 2–{MAX_VENN_SETS} sets, UpSet beyond that. UpSet works for any number of sets and shows exact intersection sizes, sorted by size.</div>
       <Divider/>
       <SLabel>Labels</SLabel>
       <Toggle value={d.showCounts!==false} onChange={v=>set(s=>({...s,showCounts:v}))} label="Show counts"/>
@@ -382,6 +400,14 @@ function useProcessedSets(lists) {
   return useMemo(() => {
     const named = lists.filter(l => l.name && l.name.trim());
     const withGenes = named.map(l => ({ name: l.name, geneSet: new Set(parseGeneList(l.genes)) }));
+    // Matching is case-insensitive (keys are upper-cased), but genes are shown
+    // and exported the way the user first wrote them — upper-casing everything
+    // turned mouse symbols like Gfap/Trem2 into GFAP/TREM2.
+    const display = {};
+    named.forEach(l => String(l.genes||"").split(/[\n,;\t\s]+/).forEach(tok => {
+      const g = tok.trim(); if (!g) return;
+      const k = g.toUpperCase(); if (!(k in display)) display[k] = g;
+    }));
     const regions = computeRegions(withGenes);
     const setSizes = withGenes.map(l => l.geneSet.size);
     const n = withGenes.length;
@@ -390,7 +416,7 @@ function useProcessedSets(lists) {
       const m = Number(mask);
       const memberSets = withGenes.map((l,i)=>({name:l.name, in: !!(m&(1<<i))}));
       const degree = memberSets.filter(s=>s.in).length;
-      return { mask:m, genes, count:genes.length, memberSets, degree };
+      return { mask:m, genes: genes.map(g=>display[g]||g), count:genes.length, memberSets, degree };
     });
     const totalUnion = regionList.reduce((a,r)=>a+r.count,0);
     return { names: withGenes.map(l=>l.name), setSizes, regionList, totalUnion, n };
@@ -406,10 +432,7 @@ function RegionTooltip({region, names, x, y, onClose, onMouseEnter, onMouseLeave
 
   const download = () => {
     const csv = "gene\n"+region.genes.join("\n");
-    const a = document.createElement("a");
-    a.href = "data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-    a.download = label.replace(/[^a-zA-Z0-9]/g,"_").slice(0,50)+"_genes.csv";
-    a.click();
+    downloadBlob(new Blob([csv],{type:"text/csv;charset=utf-8"}), label.replace(/[^a-zA-Z0-9]/g,"_").slice(0,50)+"_genes.csv"); /* blob download: data: URLs fail silently past ~2MB / in Firefox */
   };
 
   return (
@@ -474,20 +497,32 @@ function VennDiagram({names, setSizes, regionList, d, svgRef, totalUnion}) {
   // Label placement is a raster pass, so it is memoised on geometry only —
   // changing counts or colours must not re-run it.
   const labelPos = useMemo(()=>computeVennLabelPositions(ellipses, W, H, 3), [ellipses, W, H]);
-  const setLabelPos = useMemo(()=>computeSetLabelPositions(ellipses, labelPos, W, H), [ellipses, labelPos, W, H]);
+  // A margin around the ellipses lets every set name sit outside its lobe.
+  const nameFs = st.label.fontSize+1;
+  const maxNameW = Math.max(0, ...names.slice(0,n).map(nm=>String(nm).length*nameFs*0.6));
+  // (2 sets put the names straight out to the sides, so they need the full width.)
+  const PADX = Math.round(n===2 ? Math.min(200, maxNameW+16) : Math.min(170, maxNameW*0.75+12));
+  const PADY = Math.round(nameFs*2+8);
+  const setLabelPos = useMemo(()=>computeOuterSetLabels(ellipses, labelPos, W, H, names.slice(0,n), nameFs, PADX, PADY),
+    [ellipses, labelPos, W, H, n, names, nameFs, PADX, PADY]);
+  const SW = W + 2*PADX, SH = H + 2*PADY;
 
   const regionByMask = {}; regionList.forEach(r=>{ regionByMask[r.mask]=r; });
   const extraH = (d.showMethodLine!==false?18:0)+(d.plotTitle?26:0);
   const titleOff = d.plotTitle?20:0;
+  // Method line sits just under the lowest lobe (+ its set name) instead of at
+  // the canvas floor, which left a band of empty space above it.
+  const lowest = ellipses.reduce((m,e)=>{ const t=e.rot*Math.PI/180; return Math.max(m, e.cy+Math.sqrt(Math.pow(e.rx*Math.sin(t),2)+Math.pow(e.ry*Math.cos(t),2))); }, 0);
+  const methodY = Math.min(SH+extraH-6, (d.plotTitle?20:0) + PADY + Math.max(lowest, ...setLabelPos.map(p=>p.y)) + nameFs + 10);
 
   const countSize = st.ax.fontSize+2;
   const pctSize = st.tk.fontSize;
 
   return (
     <div ref={containerRef} style={{position:"relative", display:"inline-block"}}>
-    <svg ref={svgRef} width={W} height={H+extraH} viewBox={"0 0 "+W+" "+(H+extraH)} style={{display:"block", maxWidth:"100%", overflow:"visible"}}>
-      {d.plotTitle && <text x={W/2} y={18} textAnchor="middle" fontSize={st.ttl.fontSize} fontWeight={st.ttl.fontWeight} fill={C.text} fontFamily={ff}>{d.plotTitle}</text>}
-      <g transform={"translate(0,"+titleOff+")"}>
+    <svg ref={svgRef} width={SW} height={SH+extraH} viewBox={"0 0 "+SW+" "+(SH+extraH)} style={{display:"block", maxWidth:"100%", overflow:"visible"}}>
+      {d.plotTitle && <text x={SW/2} y={18} textAnchor="middle" fontSize={st.ttl.fontSize} fontWeight={st.ttl.fontWeight} fill={C.text} fontFamily={ff}>{d.plotTitle}</text>}
+      <g transform={"translate("+PADX+","+(titleOff+PADY)+")"}>
         {ellipses.map((e,i)=>(
           <ellipse key={i} cx={e.cx} cy={e.cy} rx={e.rx} ry={e.ry}
             transform={"rotate("+e.rot+" "+e.cx+" "+e.cy+")"}
@@ -495,7 +530,7 @@ function VennDiagram({names, setSizes, regionList, d, svgRef, totalUnion}) {
             stroke={(d.setColors&&d.setColors[i])||e.color} strokeWidth={d.strokeW||1.5}/>
         ))}
         {names.slice(0,n).map((name,i)=>(
-          <text key={"nl"+i} x={setLabelPos[i].x} y={setLabelPos[i].y} textAnchor="middle"
+          <text key={"nl"+i} x={setLabelPos[i].x} y={setLabelPos[i].y} textAnchor={setLabelPos[i].anchor||"middle"}
             fontSize={st.label.fontSize+1} fontWeight="700"
             fill={(d.setColors&&d.setColors[i])||SET_PALETTE[i%SET_PALETTE.length]} fontFamily={ff}>{name}</text>
         ))}
@@ -527,7 +562,7 @@ function VennDiagram({names, setSizes, regionList, d, svgRef, totalUnion}) {
         })}
       </g>
       {d.showMethodLine!==false && (
-        <text x={10} y={H+extraH-6} fontSize={8} fill={C.muted} fontFamily={ff} fontStyle="italic">{(d.method||"Set intersection")+" | "+totalUnion+" genes in union"}</text>
+        <text x={10} y={methodY} fontSize={8} fill={C.muted} fontFamily={ff} fontStyle="italic">{(d.method||"Set intersection")+" | "+totalUnion+" genes in union"}</text>
       )}
     </svg>
     {hov && <RegionTooltip region={hov.region} names={names} x={hov.x} y={hov.y} onClose={()=>setHov(null)} onMouseEnter={keepHov} onMouseLeave={hideHov} totalUnion={totalUnion}/>}
@@ -560,18 +595,30 @@ function UpSetPlot({names, setSizes, regionList, d, svgRef, totalUnion}) {
 
   const BARW = 26, BARGAP = 8;
   const MATRIXROWH = 22;
-  const ML = 130;
+  // Left block, laid out left-to-right: set-size numbers | set-size bars |
+  // set names | matrix. Names and bars used to share one anchor (ML-14) and
+  // overprint each other, with a fixed 130px margin regardless of name length.
+  const nameFs = st.label.fontSize;
+  const nameW = Math.max(40, ...names.map(nm=>String(nm).length*nameFs*0.6)) + 6;
+  const NUMW = 30, setBarsW = 80;
+  const barRight = 8 + NUMW + setBarsW;
+  const nameX = barRight + 8;
+  const ML = nameX + nameW + 12;
   const MT = 30 + (d.plotTitle?24:0);
   const chartH = 200;
   const matrixH = n*MATRIXROWH + 14;
   const PW = bars.length*(BARW+BARGAP);
   const MR = 20;
-  const setBarsW = 90;
   const W = ML + PW + MR;
   const H = MT + chartH + matrixH + (d.showMethodLine!==false?24:14);
 
   const maxCount = bars.length ? Math.max(...bars.map(b=>b.count)) : 1;
-  const by = c => MT + chartH - (c/maxCount)*chartH;
+  // Round-number axis (e.g. 0/50/100/150) instead of quarters of the max.
+  const rawStep = maxCount/4, mag = Math.pow(10, Math.floor(Math.log10(Math.max(rawStep,1e-9))));
+  const yStep = [1,2,2.5,5,10].map(m=>m*mag).find(v=>v>=rawStep) || 10*mag;
+  const yTop = Math.max(yStep, Math.ceil(maxCount/yStep)*yStep);
+  const yTicks = []; for (let v=0; v<=yTop+1e-9; v+=yStep) yTicks.push(+v.toFixed(6));
+  const by = c => MT + chartH - (c/yTop)*chartH;
   const bx = i => ML + i*(BARW+BARGAP);
 
   const maxSetSize = Math.max(...setSizes, 1);
@@ -588,15 +635,15 @@ function UpSetPlot({names, setSizes, regionList, d, svgRef, totalUnion}) {
       {d.plotTitle && <text x={W/2} y={18} textAnchor="middle" fontSize={st.ttl.fontSize} fontWeight={st.ttl.fontWeight} fill={C.text} fontFamily={ff}>{d.plotTitle}</text>}
 
       {/* Y axis grid + ticks for bar chart */}
-      {[0,0.25,0.5,0.75,1].map((t,i)=>(
-        <line key={i} x1={ML} y1={MT+chartH*(1-t)} x2={ML+PW} y2={MT+chartH*(1-t)} stroke={C.grid} strokeWidth={0.5} strokeDasharray="3 3"/>
+      {yTicks.map((v,i)=>(
+        <line key={i} x1={ML} y1={by(v)} x2={ML+PW} y2={by(v)} stroke={C.grid} strokeWidth={0.5} strokeDasharray="3 3"/>
       ))}
-      {[0,0.25,0.5,0.75,1].map((t,i)=>(
-        <text key={"t"+i} x={ML-8} y={MT+chartH*(1-t)+3} textAnchor="end" fontSize={st.tk.fontSize} fill={C.muted} fontFamily={ff}>{Math.round(maxCount*t)}</text>
+      {yTicks.map((v,i)=>(
+        <text key={"t"+i} x={ML-8} y={by(v)+3} textAnchor="end" fontSize={st.tk.fontSize} fill={C.muted} fontFamily={ff}>{v}</text>
       ))}
       <line x1={ML} y1={MT+chartH} x2={ML+PW} y2={MT+chartH} stroke={C.text} strokeWidth={1}/>
       <line x1={ML} y1={MT} x2={ML} y2={MT+chartH} stroke={C.text} strokeWidth={1}/>
-      <text x={16} y={MT+chartH/2} textAnchor="middle" fontSize={st.ax.fontSize} fill={C.text} fontFamily={ff} transform={"rotate(-90,16,"+(MT+chartH/2)+")"}>Intersection size</text>
+      <text x={ML-38} y={MT+chartH/2} textAnchor="middle" fontSize={st.ax.fontSize} fill={C.text} fontFamily={ff} transform={"rotate(-90,"+(ML-38)+","+(MT+chartH/2)+")"}>Intersection size</text>
 
       {/* Bars */}
       {bars.map((r,i)=>(
@@ -611,14 +658,14 @@ function UpSetPlot({names, setSizes, regionList, d, svgRef, totalUnion}) {
       {/* Set size bars (left of matrix) */}
       {names.map((name,ri)=>(
         <g key={"sb"+ri}>
-          <rect x={ML-14-sbx(setSizes[ri])} y={rowY(ri)-7} width={sbx(setSizes[ri])} height={14} fill={SET_PALETTE[ri%SET_PALETTE.length]} fillOpacity={0.75}/>
-          <text x={ML-18-sbx(setSizes[ri])} y={rowY(ri)+3} textAnchor="end" fontSize={8.5} fill={C.muted} fontFamily={ff}>{setSizes[ri]}</text>
+          <rect x={barRight-sbx(setSizes[ri])} y={rowY(ri)-7} width={sbx(setSizes[ri])} height={14} fill={SET_PALETTE[ri%SET_PALETTE.length]} fillOpacity={0.75}/>
+          <text x={barRight-sbx(setSizes[ri])-4} y={rowY(ri)+3} textAnchor="end" fontSize={8.5} fill={C.muted} fontFamily={ff}>{setSizes[ri]}</text>
         </g>
       ))}
 
       {/* Set name labels */}
       {names.map((name,ri)=>(
-        <text key={"sn"+ri} x={ML-14} y={rowY(ri)+3} textAnchor="end" fontSize={st.label.fontSize} fontWeight="600" fill={C.text} fontFamily={ff}>{name}</text>
+        <text key={"sn"+ri} x={nameX} y={rowY(ri)+3} textAnchor="start" fontSize={st.label.fontSize} fontWeight="600" fill={C.text} fontFamily={ff}>{name}</text>
       ))}
 
       {/* Matrix background row stripes */}
@@ -758,9 +805,9 @@ function VennFileImport({onImport, onClose, maxSets}) {
     try {
       if (/\.(xlsx|xlsm|xls)$/i.test(file.name)) {
         let XLSX;
-        try { XLSX = await import(/* @vite-ignore */ "xlsx"); }
+        try { XLSX = await loadXLSX(); }
         catch(_) {
-          setError("Excel support needs the SheetJS library, which isn't installed (npm i --save https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz — the npm registry copy is stale and unpatched). Save As → CSV works today.");
+          setError(XLSX_FAIL_MSG);
           setBusy(false); return;
         }
         const wb=XLSX.read(await file.arrayBuffer(),{type:"array"});
@@ -1168,20 +1215,19 @@ function encodeTIFF(imageData, dpi) {
 
 // Encode a canvas for download in the requested format, with correct DPI
 // metadata baked in for every raster format.
-function encodeCanvas(canvas, format, dpi) {
-  if (format === "tiff") {
-    const ctx = canvas.getContext("2d");
-    const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    return Promise.resolve(new Blob([encodeTIFF(data, dpi)], {type:"image/tiff"}));
-  }
-  const mime = format === "jpeg" ? "image/jpeg" : "image/png";
-  return canvasToBlob(canvas, mime, 0.95).then(blob=>{
-    if (format !== "png") return blob;
-    return blob.arrayBuffer().then(ab=>new Blob([pngWithDPI(ab, dpi)], {type:"image/png"}))
-                             .catch(()=>blob);   // metadata is a bonus, never a blocker
-  });
-}
+/* encodeCanvas: shared/exportUtils (adds JPEG DPI) */
 
+
+// Crop the export to what is actually drawn (plus a small pad).
+function tightViewBox(svgEl, fallbackW, fallbackH, pad) {
+  const full = {x:0, y:0, w:fallbackW, h:fallbackH};
+  if (!svgEl || typeof svgEl.getBBox !== "function") return full;
+  try {
+    const bb = svgEl.getBBox();
+    if (!bb || !(bb.width > 1) || !(bb.height > 1)) return full;
+    return {x: bb.x-pad, y: bb.y-pad, w: bb.width+pad*2, h: bb.height+pad*2};
+  } catch (_) { return full; }
+}
 
 function ExportPanel({svgRef, regionList, names}) {
   const C = useC();
@@ -1192,6 +1238,7 @@ function ExportPanel({svgRef, regionList, names}) {
   const [saving, setSaving] = useState(false);
   const [done, setDone] = useState(false);
   const [err, setErr] = useState(null);
+  const [trim, setTrim] = useState(true);
 
   const FMTS = [
     {id:"png",l:"PNG",sub:"Best for most journals"},
@@ -1203,7 +1250,8 @@ function ExportPanel({svgRef, regionList, names}) {
 
   const svgEl0 = svgRef && svgRef.current;
   const vb = svgEl0 ? (svgEl0.getAttribute("viewBox")||"0 0 520 460").split(" ").map(Number) : [0,0,520,460];
-  const nativeW = vb[2], nativeH = vb[3];
+  const box0 = trim && svgEl0 ? tightViewBox(svgEl0, vb[2], vb[3], 8) : {w:vb[2], h:vb[3]};
+  const nativeW = box0.w, nativeH = box0.h;
   const mmW = mmPreset, mmH = Math.round(mmPreset * (nativeH/nativeW));
   const pxFromMM = mm => Math.round(mm/25.4*dpi);
   const prevW = useSize ? pxFromMM(mmW) : Math.round(nativeW*dpi/96);
@@ -1230,7 +1278,9 @@ function ExportPanel({svgRef, regionList, names}) {
       if (!svgEl) { setErr("Couldn't find the diagram. Switch to the Plot or Split view and try again."); return; }
       const clone = svgEl.cloneNode(true);
       const vbParts = (svgEl.getAttribute("viewBox") || "0 0 520 460").split(" ").map(Number);
-      const svgW = vbParts[2]||520, svgH = vbParts[3]||460;
+      const box = trim ? tightViewBox(svgEl, vbParts[2]||520, vbParts[3]||460, 8) : {x:0, y:0, w:vbParts[2]||520, h:vbParts[3]||460};
+      clone.setAttribute("viewBox", box.x+" "+box.y+" "+box.w+" "+box.h);
+      const svgW = box.w, svgH = box.h;
       prepareSVGForExport(clone, svgW, svgH, null);
       const svgStr = serializeSVG(clone);
       if (fmt==="svg") {
@@ -1270,6 +1320,8 @@ function ExportPanel({svgRef, regionList, names}) {
       )}
       {fmt!=="csv"&&<>
       <SLabel>Figure Size (mm)</SLabel>
+      <Toggle value={trim} onChange={setTrim} label="Trim empty space"/>
+      <div style={{fontSize:10, color:C.muted, lineHeight:1.5, margin:"2px 0 8px"}}>Crops the exported file to the diagram itself. Leave on unless you want the blank margin kept.</div>
       <Toggle value={useSize} onChange={setUseSize} label="Set custom size in mm"/>
       {useSize&&(
         <div style={{display:"flex", flexWrap:"wrap", gap:5, marginBottom:10}}>
@@ -1363,7 +1415,7 @@ function SheetSidebar({sheets, activeId, onSelect, onNew, onRename, onDuplicate,
         <button onClick={onSave} style={{width:"100%", padding:"7px 0", borderRadius:6, fontSize:11, fontWeight:600, cursor:"pointer", background:t.success, border:"none", color:"#fff"}}>Save Project</button>
         <button onClick={()=>fileRef.current&&fileRef.current.click()} style={{width:"100%", padding:"7px 0", borderRadius:6, fontSize:11, cursor:"pointer", background:"transparent", border:"1px solid "+t.border, color:t.muted}}>Load Project</button>
         <input ref={fileRef} type="file" accept=".json" style={{display:"none"}}
-          onChange={e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>{try{onLoad(JSON.parse(ev.target.result));}catch(_){}};r.readAsText(f);e.target.value="";}}/>
+          onChange={e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>readProjectText(ev.target.result,"venn-diagram",onLoad);r.readAsText(f);e.target.value="";}}/>
         <div style={{fontSize:9, color:t.muted, textAlign:"center"}}>Ctrl+S to save</div>
       </div>
     </div>
@@ -1577,7 +1629,7 @@ export default function VennDiagramPage() {
           </div>
           <div style={{flex:1, overflowY:"auto", padding:16}}>
             {rtab==="data"  && <div style={{fontSize:11, color:C.muted, lineHeight:1.6}}>Edit gene lists in the Sets panel. Names, colours and counts update live. Up to {MAX_VENN_SETS} sets draw as a Venn diagram; more switch to UpSet.</div>}
-            {rtab==="plot"  && <PlotPanel d={d} set={setD} nSets={n}/>}
+            {rtab==="plot"  && <PlotPanel d={d} set={setD} nSets={n} effectiveMode={effectiveMode}/>}
             {rtab==="export"&& <ExportPanel svgRef={svgExportRef} regionList={regionList} names={names}/>}
           </div>
         </div>

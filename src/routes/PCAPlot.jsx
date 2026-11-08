@@ -1,5 +1,11 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
+import { readProjectText } from "../shared/projectFile";
+import { rowsToMatrixClean, guessHeaderRow } from "../shared/importUtils";
+import { loadXLSX, XLSX_FAIL_MSG } from "../shared/loadXLSX";
+import { encodeCanvas } from "../shared/exportUtils";
 import { ThemeCtx, useTheme, LIGHT } from "../shared/theme";
+import { withDefaultGroups } from "../shared/inferGroups";
+import AutoGroupButton from "../shared/AutoGroupButton";
 import CloudProjects from "../shared/CloudProjects";
 
 // ════════════════════════════════════════════════════════════════════════════
@@ -407,26 +413,9 @@ function scanGeneNames(names) {
   return {dates, sci, dupes:[...new Set(dupes)]};
 }
 
-// rows -> matrix, taking row 0 as sample headers and column 0 as gene IDs.
-function rowsToMatrix(rows, delim, headerRow, idCol) {
-  const hdr=rows[headerRow]||[];
-  const sampleNames=hdr.slice(idCol+1).map((h,i)=>h.trim()||("Sample"+(i+1)));
-  const geneNames=[], values=[];
-  let badCells=0;
-  for (let r=headerRow+1;r<rows.length;r++) {
-    const row=rows[r];
-    if (!row || row.every(c=>c.trim()==="")) continue;
-    geneNames.push((row[idCol]||"").trim());
-    const vals=[];
-    for (let c=0;c<sampleNames.length;c++) {
-      const cell=parseNumericCell(row[idCol+1+c]!==undefined?row[idCol+1+c]:"", delim);
-      if (cell.bad) badCells++;
-      vals.push(cell.value);
-    }
-    values.push(vals);
-  }
-  return {sampleNames, geneNames, values, badCells};
-}
+// rows -> matrix: see shared/importUtils (skips annotation columns, drops genes
+// with missing values instead of filling them with 0, cleans BAM-path headers).
+const rowsToMatrix = rowsToMatrixClean;
 
 function FileImport({onImport, onClose}) {
   const t=useTheme();
@@ -442,7 +431,7 @@ function FileImport({onImport, onClose}) {
   const ingestRows=(rows,delim,fileName,extra)=>{
     if (!rows.length) { setError("That file didn't contain any readable rows."); return; }
     setParsed({rows, delim, fileName, ...(extra||{})});
-    setHeaderRow(0); setIdCol(0); setError(null);
+    setHeaderRow(guessHeaderRow(rows)); setIdCol(0); setError(null);
   };
 
   const readFile = async file => {
@@ -451,9 +440,9 @@ function FileImport({onImport, onClose}) {
       const isXlsx=/\.(xlsx|xlsm|xls)$/i.test(file.name);
       if (isXlsx) {
         let XLSX;
-        try { XLSX = await import(/* @vite-ignore */ "xlsx"); }
+        try { XLSX = await loadXLSX(); }
         catch(_) {
-          setError("Excel support needs the SheetJS library, which isn't installed. Install it from the SheetJS CDN (npm i --save https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz) — the copy on the npm registry is stale and unpatched. In the meantime, Save As → CSV in Excel works today.");
+          setError(XLSX_FAIL_MSG);
           setBusy(false); return;
         }
         const buf=await file.arrayBuffer();
@@ -478,7 +467,7 @@ function FileImport({onImport, onClose}) {
     const rows=parsed.XLSX.utils.sheet_to_json(parsed.workbook.Sheets[name],{header:1,blankrows:false,raw:true})
                 .map(r=>r.map(c=>c===undefined||c===null?"":String(c)));
     setParsed(p=>({...p, rows, activeSheet:name}));
-    setHeaderRow(0); setIdCol(0);
+    setHeaderRow(guessHeaderRow(rows)); setIdCol(0);
   };
 
   const built = useMemo(()=>{
@@ -492,7 +481,8 @@ function FileImport({onImport, onClose}) {
     let geneNames=[...built.geneNames];
     if (repair) built.scan.dates.forEach(d=>{ if(d.suggested) geneNames[d.i]=d.suggested; });
     const warnings=[];
-    if (built.badCells>0) warnings.push(built.badCells+" cell(s) weren't numeric and were set to 0.");
+    if (built.droppedRows>0) warnings.push(built.droppedRows+" gene(s) with missing or non-numeric values (NA, blank, text) were left out.");
+    if (built.skippedCols && built.skippedCols.length) warnings.push("Skipped non-sample column(s): "+built.skippedCols.slice(0,6).join(", ")+(built.skippedCols.length>6?"…":"")+".");
     const unrepaired=built.scan.dates.filter(d=>!d.suggested||!repair).length;
     if (unrepaired>0) warnings.push(unrepaired+" gene name(s) still look like dates — check them against your source file.");
     if (built.scan.sci.length>0) warnings.push(built.scan.sci.length+" gene ID(s) look like Excel turned them into scientific notation (e.g. 2310009E13). These can't be recovered automatically.");
@@ -516,7 +506,7 @@ function FileImport({onImport, onClose}) {
           onClick={()=>inputRef.current&&inputRef.current.click()}
           style={{border:"2px dashed "+(drag?t.accent:t.cBorder), borderRadius:8, padding:"26px 16px", textAlign:"center", cursor:"pointer", background:drag?t.cSel:t.cBg}}>
           <div style={{fontSize:12, fontWeight:600, color:t.text, marginBottom:3}}>{busy?"Reading…":"Drop a file here, or click to browse"}</div>
-          <div style={{fontSize:10.5, color:t.muted}}>CSV, TSV, or TXT · Excel .xlsx if SheetJS is installed</div>
+          <div style={{fontSize:10.5, color:t.muted}}>CSV, TSV, or TXT · Excel .xlsx</div>
         </div>
         <input ref={inputRef} type="file" accept=".csv,.tsv,.txt,.tab,.xlsx,.xlsm,.xls" style={{display:"none"}}
           onChange={e=>{const f=e.target.files[0];if(f)readFile(f);e.target.value="";}}/>
@@ -618,9 +608,10 @@ function FileImport({onImport, onClose}) {
         </div>
       )}
 
-      {built.badCells>0&&(
-        <div style={{fontSize:11, padding:"8px 10px", borderRadius:6, marginBottom:9, background:t.tag, color:t.tagText, border:"1px solid "+t.cBorder}}>
-          {built.badCells} non-numeric cell{built.badCells!==1?"s":""} will import as 0.
+      {(built.droppedRows>0||built.skippedCols.length>0)&&(
+        <div style={{fontSize:11, lineHeight:1.6, padding:"8px 10px", borderRadius:6, marginBottom:9, background:t.tag, color:t.tagText, border:"1px solid "+t.cBorder}}>
+          {built.droppedRows>0&&<div>{built.droppedRows} gene{built.droppedRows!==1?"s":""} with missing values (NA, blank or text) will be left out.</div>}
+          {built.skippedCols.length>0&&<div>Skipping non-sample column{built.skippedCols.length!==1?"s":""}: {built.skippedCols.slice(0,6).join(", ")}{built.skippedCols.length>6?"…":""}</div>}
         </div>
       )}
 
@@ -943,6 +934,7 @@ function SampleGroupsPanel({sampleNames, sampleGroups, setSampleGroups, groupCol
       <div style={{fontSize:11, color:t.muted, marginBottom:10, lineHeight:1.5}}>
         Group names drive point color and the confidence ellipses. Samples with the same group name are treated as replicates.
       </div>
+      <AutoGroupButton sampleNames={sampleNames} setSampleGroups={setSampleGroups}/>
       <div style={{border:"1px solid "+t.border, borderRadius:8, overflow:"hidden", marginBottom:14}}>
         {sampleNames.map((s,i)=>(
           <div key={s} style={{display:"flex", alignItems:"center", gap:8, padding:"6px 10px", borderBottom:i<sampleNames.length-1?"1px solid "+t.cBorder:"none", background:i%2===0?t.cBg:t.panel}}>
@@ -1458,19 +1450,7 @@ function encodeTIFF(imageData, dpi) {
 
 // Encode a canvas for download in the requested format, with correct DPI
 // metadata baked in for every raster format.
-function encodeCanvas(canvas, format, dpi) {
-  if (format === "tiff") {
-    const ctx = canvas.getContext("2d");
-    const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    return Promise.resolve(new Blob([encodeTIFF(data, dpi)], {type:"image/tiff"}));
-  }
-  const mime = format === "jpeg" ? "image/jpeg" : "image/png";
-  return canvasToBlob(canvas, mime, 0.95).then(blob=>{
-    if (format !== "png") return blob;
-    return blob.arrayBuffer().then(ab=>new Blob([pngWithDPI(ab, dpi)], {type:"image/png"}))
-                             .catch(()=>blob);   // metadata is a bonus, never a blocker
-  });
-}
+/* encodeCanvas: shared/exportUtils (adds JPEG DPI) */
 
 function ExportPanel({plotRef, display}) {
   const t=useTheme();
@@ -1724,29 +1704,53 @@ function PCAScatter({samples, varExplained, stats, display, groupColors, legendV
   const yTk=useMemo(()=>niceTicks(y1,y2,5),[y1,y2]);
   const xTicks=xTk.ticks, yTicks=yTk.ticks;
 
+  // Sample-label placement. Labels are drawn text-anchor "start" at
+  // (x, y=baseline), so a label's box is [x, x+w] x [y-h+1, y+2]. The old
+  // version treated x as the box centre, never avoided dots, let labels drift
+  // 30px outside the frame, and silently hid any label pushed >200px away.
   const labelPositions = useMemo(()=>{
     if (!showLabels || !repel) return {};
-    const positions={};
-    points.forEach(p=>{ const cx=scaleX(p.x), cy=scaleY(p.y); positions[p.name]={x:cx+dotRadius+3,y:cy+4,ox:cx,oy:cy,w:(p.name.length*6)+4,h:10}; });
-    const names=Object.keys(positions);
-    for (let iter=0;iter<25;iter++) {
+    const fs=style.pointLabel.fontSize||9, charW=fs*0.58, h=fs+1;
+    const L=ML+2, R=ML+innerW-2, T=MT+2, B=MT+PLOT_H-2;
+    const dots=points.map(p=>({x:scaleX(p.x), y:scaleY(p.y), r:dotRadius+2}));
+    const pos={};
+    points.forEach(p=>{
+      const cx=scaleX(p.x), cy=scaleY(p.y), w=p.name.length*charW+2;
+      // start on the right of the dot, or the left if that would leave the frame
+      let x=cx+dotRadius+3; if (x+w>R) x=cx-dotRadius-3-w;
+      pos[p.name]={x, y:cy+fs*0.35, ox:cx, oy:cy, hx:x, hy:cy+fs*0.35, w, h};
+    });
+    const names=Object.keys(pos);
+    for (let it=0; it<150; it++) {
+      let moved=0;
       names.forEach(nm=>{
-        const pos=positions[nm]; let fx=0,fy=0;
+        const a=pos[nm]; let fx=0, fy=0;
+        const ax0=a.x, ax1=a.x+a.w, ay0=a.y-a.h+1, ay1=a.y+2;
         names.forEach(nm2=>{
           if (nm===nm2) return;
-          const other=positions[nm2], dx=pos.x-other.x, dy=pos.y-other.y;
-          const overlapX=Math.max(0,(pos.w/2+other.w/2+2)-Math.abs(dx));
-          const overlapY=Math.max(0,(pos.h+other.h+3)-Math.abs(dy));
-          if (overlapX>0&&overlapY>0) { fx+=dx>=0?overlapX*0.5:-overlapX*0.5; fy+=dy>=0?overlapY*0.4:-overlapY*0.4; }
+          const b=pos[nm2], bx0=b.x, bx1=b.x+b.w, by0=b.y-b.h+1, by1=b.y+2;
+          const ox=Math.min(ax1,bx1)-Math.max(ax0,bx0)+2, oy=Math.min(ay1,by1)-Math.max(ay0,by0)+2;
+          if (ox>0&&oy>0) {
+            const dx=(ax0+ax1)-(bx0+bx1), dy=(ay0+ay1)-(by0+by1);
+            if (oy<=ox) fy+=(dy>=0?1:-1)*oy*0.5; else fx+=(dx>=0?1:-1)*ox*0.5;
+          }
         });
-        fx+=(pos.ox+dotRadius+3-pos.x)*0.05; fy+=(pos.oy+4-pos.y)*0.05;
-        pos.x+=fx; pos.y+=fy;
-        pos.x=Math.max(ML+2,Math.min(ML+innerW+30,pos.x));
-        pos.y=Math.max(MT+8,Math.min(MT+PLOT_H+10,pos.y));
+        dots.forEach(o=>{
+          const nx=Math.max(ax0,Math.min(o.x,ax1)), ny=Math.max(ay0,Math.min(o.y,ay1));
+          let dx=nx-o.x, dy=ny-o.y; const dd=Math.hypot(dx,dy);
+          if (dd>=o.r) return;
+          if (dd<1e-6) { dx=(ax0+ax1)/2-o.x; dy=(ay0+ay1)/2-o.y; const m=Math.hypot(dx,dy)||1; dx/=m; dy/=m; }
+          else { dx/=dd; dy/=dd; }
+          const push=(o.r-dd)*0.6; fx+=dx*push; fy+=dy*push;
+        });
+        fx+=(a.hx-a.x)*0.03; fy+=(a.hy-a.y)*0.03;
+        const nx=Math.max(L,Math.min(R-a.w,a.x+fx)), ny=Math.max(T+a.h,Math.min(B,a.y+fy));
+        moved+=Math.abs(nx-a.x)+Math.abs(ny-a.y); a.x=nx; a.y=ny;
       });
+      if (moved<0.05) break;
     }
-    return positions;
-  },[points,showLabels,repel,dotRadius,scaleX,scaleY]);
+    return pos;
+  },[points,showLabels,repel,dotRadius,scaleX,scaleY,style.pointLabel.fontSize,innerW]);
 
   // Map the already-computed data-space ellipses into pixel space now that
   // the (ellipse-aware) scale functions exist.
@@ -1874,7 +1878,12 @@ function PCAScatter({samples, varExplained, stats, display, groupColors, legendV
             <g key={i} onMouseEnter={()=>setHovered({...p,cx,cy})} onMouseLeave={()=>setHovered(null)}>
               {isHovered&&<circle cx={cx} cy={cy} r={dotRadius+4} fill={col} fillOpacity={0.2}/>}
               <circle cx={cx} cy={cy} r={dotRadius} fill={col} fillOpacity={0.9} stroke={isHovered?"#fff":col} strokeWidth={isHovered?2:1}/>
-              {showLabels&&(!repel||(Math.abs(lx-cx)<200))&&<text x={lx} y={ly} fontSize={style.pointLabel.fontSize||9} fontWeight={style.pointLabel.fontWeight} fontStyle={style.pointLabel.fontStyle} fill={style.pointLabel.fill} fontFamily={style.font} style={{pointerEvents:"none"}}>{p.name}</text>}
+              {showLabels&&labelPos&&(()=>{
+                const tx=Math.max(labelPos.x,Math.min(cx,labelPos.x+labelPos.w)), ty=Math.max(labelPos.y-labelPos.h+1,Math.min(cy,labelPos.y+2));
+                const dl=Math.hypot(tx-cx,ty-cy); if(dl<dotRadius+7) return null;
+                return <line x1={cx+(tx-cx)/dl*(dotRadius+2)} y1={cy+(ty-cy)/dl*(dotRadius+2)} x2={tx} y2={ty} stroke={style.pointLabel.fill} strokeWidth={0.6} strokeOpacity={0.55} style={{pointerEvents:"none"}}/>;
+              })()}
+              {showLabels&&<text x={lx} y={ly} fontSize={style.pointLabel.fontSize||9} fontWeight={style.pointLabel.fontWeight} fontStyle={style.pointLabel.fontStyle} fill={style.pointLabel.fill} fontFamily={style.font} style={{pointerEvents:"none"}}>{p.name}</text>}
             </g>
           );
         })}
@@ -2005,7 +2014,7 @@ function SheetSidebar({sheets, activeId, onSelect, onNew, onRename, onDuplicate,
         <button onClick={onSave} style={{width:"100%", padding:"7px 0", borderRadius:6, fontSize:11, fontWeight:600, cursor:"pointer", background:t.success, border:"none", color:"#fff"}}>Save Project</button>
         <button onClick={()=>fileRef.current&&fileRef.current.click()} style={{width:"100%", padding:"7px 0", borderRadius:6, fontSize:11, cursor:"pointer", background:"transparent", border:"1px solid "+t.border, color:t.muted}}>Load Project</button>
         <input ref={fileRef} type="file" accept=".json" style={{display:"none"}}
-          onChange={e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>{try{onLoad(JSON.parse(ev.target.result));}catch(_){}};r.readAsText(f);e.target.value="";}}/>
+          onChange={e=>{const f=e.target.files[0];if(!f)return;const r=new FileReader();r.onload=ev=>readProjectText(ev.target.result,"pca-plot",onLoad);r.readAsText(f);e.target.value="";}}/>
         <div style={{fontSize:9, color:t.muted, textAlign:"center"}}>Ctrl+S to save</div>
       </div>
     </div>
@@ -2102,10 +2111,7 @@ export default function PCAPlotPage() {
 
   // ── Save / load: one file holds every sheet ──────────────────────────────
   const saveProject = useCallback(()=>{
-    const a=document.createElement("a");
-    a.href="data:application/json;charset=utf-8,"+encodeURIComponent(JSON.stringify({version:2, tool:"pca-plot", sheets},null,2));
-    a.download="pca_plot_project_"+new Date().toISOString().slice(0,10)+".json";
-    a.click();
+    downloadBlob(new Blob([JSON.stringify({version:2, tool:"pca-plot", sheets},null,2)],{type:"application/json;charset=utf-8"}), "pca_plot_project_"+new Date().toISOString().slice(0,10)+".json"); /* blob download: data: URLs fail silently past ~2MB / in Firefox */
   },[sheets]);
 
   const loadProject = data => {
@@ -2145,11 +2151,9 @@ export default function PCAPlotPage() {
   // Every newly-seen sample defaults into "Group 1" so it always has a valid group.
   useEffect(()=>{
     if (!matrix.sampleNames.length) return;
-    setSampleGroups(prev=>{
-      const next={...prev}; let changed=false;
-      matrix.sampleNames.forEach(s=>{ if(!next[s]){ next[s]="Group 1"; changed=true; } });
-      return changed?next:prev;
-    });
+    // New samples get a group guessed from their names (Ctrl_1 -> "Ctrl")
+    // when nothing has been assigned yet; otherwise the default "Group 1".
+    setSampleGroups(prev=>withDefaultGroups(prev, matrix.sampleNames));
   },[matrix.sampleNames, setSampleGroups]);
 
   // Full resync: a color survives only while its group still has samples.

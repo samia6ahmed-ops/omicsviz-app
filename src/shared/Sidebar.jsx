@@ -5,7 +5,7 @@ import { ToolGlyph } from "./ToolGlyph";
 import { LogoMark } from "./LogoMark";
 import { UMBRELLAS } from "./tools";
 
-export default function Sidebar() {
+export default function Sidebar({ drawer = false, open = false }) {
   const C = useTheme();
   const location = useLocation();
 
@@ -16,10 +16,17 @@ export default function Sidebar() {
 
   return (
     <nav
+      aria-hidden={drawer && !open ? true : undefined}
       style={{
-        width: 240,
+        width: drawer ? "min(280px, 84vw)" : 240,
         flexShrink: 0,
         height: "100%",
+        ...(drawer ? {
+          position: "fixed", left: 0, top: 0, zIndex: 60,
+          transform: open ? "translateX(0)" : "translateX(-105%)",
+          transition: "transform .22s ease",
+          boxShadow: open ? "0 0 40px rgba(0,0,0,.25)" : "none",
+        } : null),
         background: C.panel,
         borderRight: "1px solid " + C.border,
         display: "flex",
@@ -50,24 +57,9 @@ export default function Sidebar() {
       </div>
 
       <div style={{ padding: "0 12px" }}>
-        <NavLink
-          to="/about"
-          style={({ isActive }) => ({
-            display: "flex",
-            alignItems: "center",
-            gap: 8,
-            padding: "8px 10px",
-            margin: "1px 0",
-            borderRadius: 6,
-            textDecoration: "none",
-            fontSize: 12.5,
-            fontWeight: isActive ? 700 : 600,
-            color: isActive ? C.accent : C.text,
-            background: isActive ? C.cSel : "transparent",
-          })}
-        >
-          About
-        </NavLink>
+        {[["/about", "About"], ["/methods", "Methods"]].map(([to, label]) => (
+          <NavLink key={to} to={to} style={({ isActive }) => linkStyle(C, isActive)}>{label}</NavLink>
+        ))}
       </div>
 
       <div style={{ padding: "4px 12px", flex: 1 }}>
@@ -151,6 +143,26 @@ export default function Sidebar() {
           );
         })}
       </div>
+
+      <div style={{ padding: "8px 12px 14px", borderTop: "1px solid " + C.border }}>
+        <NavLink to="/contact" style={({ isActive }) => linkStyle(C, isActive)}>Contact &amp; feedback</NavLink>
+      </div>
     </nav>
   );
+}
+
+function linkStyle(C, isActive) {
+  return {
+    display: "flex",
+    alignItems: "center",
+    gap: 8,
+    padding: "8px 10px",
+    margin: "1px 0",
+    borderRadius: 6,
+    textDecoration: "none",
+    fontSize: 12.5,
+    fontWeight: isActive ? 700 : 600,
+    color: isActive ? C.accent : C.text,
+    background: isActive ? C.cSel : "transparent",
+  };
 }

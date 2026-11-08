@@ -1,4 +1,8 @@
 import React, { useState, useMemo, useRef, useCallback, useEffect, useContext } from "react";
+import { readProjectText } from "../shared/projectFile";
+import { parseLocaleNumber, guessHeaderRow } from "../shared/importUtils";
+import { loadXLSX, XLSX_FAIL_MSG } from "../shared/loadXLSX";
+import { encodeCanvas } from "../shared/exportUtils";
 import { ThemeCtx as TC, useTheme, LIGHT } from "../shared/theme";
 import CloudProjects from "../shared/CloudProjects";
 
@@ -97,7 +101,7 @@ const DEF_D = {
   termsz:10, termbd:false,
   colorScale:"viridis", colorScaleMode:"log",
   pbg:"", gc:"", aw:1.2, gw:0.5, showGrid:true,
-  method:"ORA", database:"KEGG 2025", correction:"BH", showMethodLine:true,
+  method:"ORA", database:"", correction:"BH", showMethodLine:true,
   // Prism-style frame settings — apply to Dot Plot and Bar Plot only (a
   // force-directed network graph has no cartesian axes to frame).
   frameStyle:"L",      // "L" (bottom+left only, current default) | "box" (all 4 sides)
@@ -399,6 +403,24 @@ function parseRankedList(text) {
 // Hard-breaking prevents any single line from ever exceeding maxChars — this is
 // what closes the residual collision risk found when a term contains one very
 // long word (e.g. "spliceosome", "cyclin-dependent") that alone exceeds the wrap width.
+// Method line under the figure. The database used to default to "KEGG 2025",
+// so imported GO results were captioned as KEGG on the exported figure. Now it
+// is whatever the user typed, else inferred from the results' category column
+// (BP -> GO Biological Process, …), else left out rather than guessed.
+const CATEGORY_NAMES = { BP:"GO Biological Process", "GO:BP":"GO Biological Process", MF:"GO Molecular Function", "GO:MF":"GO Molecular Function",
+  CC:"GO Cellular Component", "GO:CC":"GO Cellular Component", KEGG:"KEGG", REAC:"Reactome", REACTOME:"Reactome", WP:"WikiPathways", HALLMARK:"MSigDB Hallmark" };
+function inferDatabase(rows) {
+  const cats = [...new Set((rows||[]).map(r=>String(r.category||"").trim()).filter(Boolean))];
+  if (!cats.length) return "";
+  const names = [...new Set(cats.map(c=>CATEGORY_NAMES[c.toUpperCase()]||c))];
+  return names.length > 3 ? names.slice(0,3).join(" + ")+" + …" : names.join(" + ");
+}
+function buildMethodText(d, rows) {
+  const db = (d.database||"").trim() || inferDatabase(rows);
+  const corr = d.correction==="none" ? "uncorrected" : (d.correction||"BH")+"-corrected";
+  return [d.method||"ORA", db, corr].filter(Boolean).join(" | ");
+}
+
 function wrapText(text, maxChars, maxLines){
   const words=String(text).split(" ");
   const lines=[]; let cur="";
@@ -414,7 +436,12 @@ function wrapText(text, maxChars, maxLines){
   });
   if(cur)lines.push(cur);
   if(maxLines && lines.length>maxLines){
+    // Mark the cut: a silently truncated label ("antigen processing and")
+    // reads as a different, wrong term name.
     const kept=lines.slice(0,maxLines);
+    let last=kept[maxLines-1].replace(/[\s,;:-]+$/,"");
+    if (last.length > maxChars-1) last = last.slice(0, maxChars-1).replace(/[\s,;:-]+$/,"");
+    kept[maxLines-1]=last+"\u2026";
     return kept;
   }
   return lines;
@@ -460,13 +487,17 @@ function forceLayout(nodeIds, edges, opts={}) {
       disp[source].x -= dx*force; disp[source].y -= dy*force;
       disp[target].x += dx*force; disp[target].y += dy*force;
     });
+    // Gravity toward the centre. Plain FR has none, so in an enrichment map —
+    // where many terms share no genes — unconnected nodes repelled each other
+    // straight into the walls and the figure became a ring of nodes around an
+    // empty middle. A weak linear pull packs components into a disc instead.
+    const g = opts.gravity!=null ? opts.gravity : 0.9;
+    nodeIds.forEach(n=>{ disp[n].x -= (pos[n].x-W/2)*g*k/W*4; disp[n].y -= (pos[n].y-H/2)*g*k/H*4; });
     nodeIds.forEach(n=>{
       const d = disp[n];
       const dist = Math.sqrt(d.x*d.x+d.y*d.y)||0.01;
       pos[n].x += (d.x/dist)*Math.min(dist,temp);
       pos[n].y += (d.y/dist)*Math.min(dist,temp);
-      pos[n].x = Math.min(W-20, Math.max(20, pos[n].x));
-      pos[n].y = Math.min(H-20, Math.max(20, pos[n].y));
     });
     temp *= 0.97;
   }
@@ -593,15 +624,7 @@ function parseDelimitedText(text) {
   return {rows:rawLines.map(l=>splitDelimLine(l,delim).map(c=>c.trim())), delim};
 }
 
-function parseImportNumber(raw) {
-  const s=String(raw).trim();
-  if (s==="" || /^(na|nan|null|-|inf)$/i.test(s)) return null;
-  let cand=s;
-  if (/^-?\d{1,3}(,\d{3})+(\.\d+)?$/.test(s)) cand=s.replace(/,/g,"");
-  if (!/^-?(\d+\.?\d*|\.\d+)(e[-+]?\d+)?$/i.test(cand)) return null;
-  const v=parseFloat(cand);
-  return isFinite(v) ? v : null;
-}
+const parseImportNumber = parseLocaleNumber;   /* shared/importUtils: NA, EU decimal comma incl. 1,1e-27 */
 
 // Header patterns per field, in priority order. Covers clusterProfiler, DAVID,
 // Enrichr, g:Profiler, GSEA and GOseq output.
@@ -677,8 +700,7 @@ function PathwayFileImport({onImport, onClose}) {
   const applyRows=(rows,delim,fileName,extra)=>{
     if (!rows.length) { setError("That file didn't contain any readable rows."); return; }
     setParsed({rows, delim, fileName, ...(extra||{})});
-    setHeaderRow(0);
-    setMap(autoDetectPathwayFields(rows[0]||[]));
+    { const hr=guessHeaderRow(rows); setHeaderRow(hr); setMap(autoDetectPathwayFields(rows[hr]||[])); }
     setError(null);
   };
 
@@ -687,9 +709,9 @@ function PathwayFileImport({onImport, onClose}) {
     try {
       if (/\.(xlsx|xlsm|xls)$/i.test(file.name)) {
         let XLSX;
-        try { XLSX = await import(/* @vite-ignore */ "xlsx"); }
+        try { XLSX = await loadXLSX(); }
         catch(_) {
-          setError("Excel support needs the SheetJS library, which isn't installed. Install it from the SheetJS CDN (npm i --save https://cdn.sheetjs.com/xlsx-0.20.3/xlsx-0.20.3.tgz) — the copy on the npm registry is stale and unpatched. Save As → CSV in Excel works today.");
+          setError(XLSX_FAIL_MSG);
           setBusy(false); return;
         }
         const wb=XLSX.read(await file.arrayBuffer(),{type:"array"});
@@ -712,8 +734,7 @@ function PathwayFileImport({onImport, onClose}) {
     const rows=parsed.XLSX.utils.sheet_to_json(parsed.workbook.Sheets[name],{header:1,blankrows:false,raw:true})
                 .map(r=>r.map(c=>c===undefined||c===null?"":String(c)));
     setParsed(p=>({...p, rows, activeSheet:name}));
-    setHeaderRow(0);
-    setMap(autoDetectPathwayFields(rows[0]||[]));
+    { const hr=guessHeaderRow(rows); setHeaderRow(hr); setMap(autoDetectPathwayFields(rows[hr]||[])); }
   };
 
   const built = useMemo(()=>{
@@ -724,12 +745,12 @@ function PathwayFileImport({onImport, onClose}) {
       const row=parsed.rows[r];
       if (!row || row.every(c=>String(c).trim()==="")) continue;
       const term=get(row,"term");
-      const p=parseImportNumber(get(row,"pvalue"));
+      const p=parseImportNumber(get(row,"pvalue"), parsed.delim);
       if (!term || p===null) { dropped++; continue; }
       const rec={term, category:get(row,"category"), pvalue:p};
-      const padj=parseImportNumber(get(row,"padj")); if(padj!==null) rec.padj=padj;
-      const nes=parseImportNumber(get(row,"NES"));   if(nes!==null)  rec.NES=nes;
-      let count=parseImportNumber(get(row,"count"));
+      const padj=parseImportNumber(get(row,"padj"), parsed.delim); if(padj!==null) rec.padj=padj;
+      const nes=parseImportNumber(get(row,"NES"), parsed.delim);   if(nes!==null)  rec.NES=nes;
+      let count=parseImportNumber(get(row,"count"), parsed.delim);
       const ratio=splitRatio(get(row,"ratio"));
       if (ratio) {
         if (ratio.d!==null) { rec.geneRatioN=ratio.n; rec.geneRatioD=ratio.d; ratioSplit++; }
@@ -740,7 +761,7 @@ function PathwayFileImport({onImport, onClose}) {
       // DAVID and friends give the ratio as two separate columns (Count and
       // List Total) rather than a "15/120" string.
       if (rec.geneRatioD===undefined) {
-        const rd=parseImportNumber(get(row,"ratioD"));
+        const rd=parseImportNumber(get(row,"ratioD"), parsed.delim);
         if (rd!==null && rd>0) rec.geneRatioD=rd;
       }
       const rawGenes=get(row,"genes");
@@ -1169,7 +1190,7 @@ function PlotPanel({d, set, plotType}) {
         <input value={d.database||""} onChange={e=>set(s=>({...s,database:e.target.value}))} placeholder="e.g. KEGG 2025, GO Biological Process"
           style={{width:"100%", boxSizing:"border-box", padding:"6px 9px", fontSize:11, borderRadius:6, border:"1px solid "+C.border, background:C.cBg, color:C.text, outline:"none"}}/></div>
       <div style={{padding:"7px 9px", borderRadius:6, background:C.panel2, border:"1px solid "+C.border, fontSize:10, color:C.muted, marginBottom:10}}>
-        Preview: <span style={{color:C.text, fontWeight:600}}>{(d.method||"ORA")+", "+(d.database||"KEGG")+", "+(d.correction==="none"?"uncorrected":(d.correction||"BH")+"-corrected")}</span>
+        Preview: <span style={{color:C.text, fontWeight:600}}>{d.database ? buildMethodText(d, []).split(" | ").join(", ") : (d.method||"ORA")+", <database from your data's category column>, "+(d.correction==="none"?"uncorrected":(d.correction||"BH")+"-corrected")}</span>
       </div>
       <Divider/>
       <SLabel>Figure Size</SLabel>
@@ -1438,10 +1459,7 @@ function PlotTooltip({term, x, y, onClose, onExclude, onDownload, pColLabel, onM
   const downloadGenes = () => {
     if (!geneList.length) return;
     const csv = "gene\n" + geneList.join("\n");
-    const a = document.createElement("a");
-    a.href = "data:text/csv;charset=utf-8," + encodeURIComponent(csv);
-    a.download = t.term.slice(0,40).replace(/[^a-zA-Z0-9]/g,"_") + "_genes.csv";
-    a.click();
+    downloadBlob(new Blob([csv],{type:"text/csv;charset=utf-8"}), t.term.slice(0,40).replace(/[^a-zA-Z0-9]/g,"_") + "_genes.csv"); /* blob download: data: URLs fail silently past ~2MB / in Firefox */
     onDownload && onDownload(t);
   };
 
@@ -1637,7 +1655,17 @@ function LegendCard({x, y, C, ff, title, colorFn, legendTicks, useLog, cMin, cMa
   const barW = L.barW || 12, gradH = L.barH || 90, gap = L.gap || 22;
   // Show every tick that was generated. Previously only the first, middle and
   // last were drawn, so a colour bar could never carry more than three labels.
-  const ticks3 = legendTicks || [];
+  // Keep both end ticks, then add interior ticks only where their label has
+  // room — a nice tick landing next to an end value ("0.001" / "0.0036")
+  // printed one label on top of the other.
+  const ticks3 = (()=>{
+    const all = (legendTicks || []).slice().sort((a,b)=>a.t-b.t);
+    if (all.length <= 2) return all;
+    const minGap = (tickSz + 2) / gradH;
+    const kept = [all[0], all[all.length-1]];
+    all.slice(1,-1).forEach(tk=>{ if (kept.every(k=>Math.abs(k.t-tk.t) >= minGap)) kept.push(tk); });
+    return kept;
+  })();
   const sizes = (countTicks && countTicks.length) ? countTicks : [cMin, Math.round((cMin+cMax)/2), cMax];
   return (
     <g transform={"translate("+x+","+y+")"}>
@@ -1842,7 +1870,7 @@ function DotPlot({rows, sets, d, svgRef, onExclude, onDownloadGenes}) {
     return acc;
   }, []) : [];
 
-  const methodText = (d.method||"ORA")+" | "+(d.database||"KEGG")+" | "+(d.correction==="none"?"uncorrected":(d.correction||"BH")+"-corrected");
+  const methodText = buildMethodText(d, rows);
   const extraH = (d.showMethodLine!==false?16:0)+(d.plotTitle?22:0)+(ratioFallback?16:0);
 
   return (
@@ -1968,7 +1996,7 @@ function BarPlot({rows, sets, d, svgRef, onExclude, onDownloadGenes}) {
     if (useLog) return nlpMax>nlpMin ? (t.nlp-nlpMin)/(nlpMax-nlpMin) : 0.5;
     return sigMax>sigMin ? 1-((t.sigVal-sigMin)/(sigMax-sigMin)) : 0.5;
   };
-  const methodText = (d.method||"ORA")+" | "+(d.database||"KEGG")+" | "+(d.correction==="none"?"uncorrected":(d.correction||"BH")+"-corrected");
+  const methodText = buildMethodText(d, rows);
   const wrapWidth = sets.wrapWidth || 38;
   const labelAngle = Math.max(0, Math.min(90, sets.vertLabelAngle||0));
 
@@ -2108,8 +2136,8 @@ function BarPlot({rows, sets, d, svgRef, onExclude, onDownloadGenes}) {
             );
           })}
 
-          <LegendDragHandle x={legDrag.pos.x} y={legDrag.pos.y} h={180} dragging={legDrag.dragging} onDragStart={legDrag.onDragStart}/>
-          <LegendCard x={legDrag.pos.x} y={legDrag.pos.y} C={C} ff={ff} title={sets.pCol==="padj"?"adj. p":"p-value"}
+          <LegendDragHandle x={legDrag.moved?legDrag.pos.x:ML_V+PW_V+18} y={legDrag.moved?legDrag.pos.y:MT_V} h={180} dragging={legDrag.dragging} onDragStart={legDrag.onDragStart}/>
+          <LegendCard x={legDrag.moved?legDrag.pos.x:ML_V+PW_V+18} y={legDrag.moved?legDrag.pos.y:MT_V} C={C} ff={ff} title={sets.pCol==="padj"?"adj. p":"p-value"}
             colorFn={colorFn} legendTicks={barLegendTicks} useLog={useLog} showSizeLegend={false} lg={lgSet}/>
 
           {d.showMethodLine!==false&&(
@@ -2156,6 +2184,8 @@ function BarPlot({rows, sets, d, svgRef, onExclude, onDownloadGenes}) {
   const PH = Math.max(200, totalRowsH);
   const W = ML+PW+MR;
   const H = MT+PH+MB;
+  const hLegX = legDrag.moved ? legDrag.pos.x : ML+PW+34;
+  const hLegY = legDrag.moved ? legDrag.pos.y : MT+4;
 
   const sx = v => ML + ((v-vMin)/(Math.max(vMax-vMin,1e-9)))*PW;
   const xTicks = barXTicks;
@@ -2246,8 +2276,10 @@ function BarPlot({rows, sets, d, svgRef, onExclude, onDownloadGenes}) {
           !sep.isFirst && <line key={"bsep"+i} x1={ML} y1={sep.y} x2={ML+PW} y2={sep.y} stroke={C.muted} strokeWidth={1} strokeDasharray="5 3" strokeOpacity={0.5}/>
         ))}
 
-        <LegendDragHandle x={legDrag.pos.x} y={legDrag.pos.y} h={180} dragging={legDrag.dragging} onDragStart={legDrag.onDragStart}/>
-        <LegendCard x={legDrag.pos.x} y={legDrag.pos.y} C={C} ff={ff} title={sets.pCol==="padj"?"adj. p":"p-value"}
+        {/* Legend follows the plot edge (+ room for the count labels) until the
+            user drags it — it used to sit at a fixed x=520, on top of long bars. */}
+        <LegendDragHandle x={hLegX} y={hLegY} h={180} dragging={legDrag.dragging} onDragStart={legDrag.onDragStart}/>
+        <LegendCard x={hLegX} y={hLegY} C={C} ff={ff} title={sets.pCol==="padj"?"adj. p":"p-value"}
           colorFn={colorFn} legendTicks={legendTicks} useLog={useLog} showSizeLegend={false} lg={lgSet}/>
 
         {d.showMethodLine!==false && (
@@ -2307,10 +2339,7 @@ function NodeTooltip({node, x, y, onClose, onMouseEnter, onMouseLeave}) {
   const more = node.genes.length - visibleGenes.length;
   const download = () => {
     const csv = "gene\n"+node.genes.join("\n");
-    const a = document.createElement("a");
-    a.href = "data:text/csv;charset=utf-8,"+encodeURIComponent(csv);
-    a.download = node.term.slice(0,40).replace(/[^a-zA-Z0-9]/g,"_")+"_genes.csv";
-    a.click();
+    downloadBlob(new Blob([csv],{type:"text/csv;charset=utf-8"}), node.term.slice(0,40).replace(/[^a-zA-Z0-9]/g,"_")+"_genes.csv"); /* blob download: data: URLs fail silently past ~2MB / in Firefox */
   };
   return (
     <div onMouseEnter={onMouseEnter} onMouseLeave={onMouseLeave} style={{
@@ -2415,6 +2444,45 @@ function NetworkGraph({rows, sets, d, svgRef}) {
 
   const methodText = (d.method||"ORA")+" | edges = Jaccard gene overlap \u2265 "+((d.netSimThreshold||0.25)*100).toFixed(0)+"%";
 
+  // Final placement: scale the force layout to fit the canvas (rather than
+  // clamping nodes against the walls), then push apart any node+label boxes
+  // that still overlap. Each box spans the circle and its wrapped label below.
+  const placed = useMemo(()=>{
+    if (!nodes.length) return {};
+    const FS=9, LH=10;
+    const boxes = nodes.map(n=>{
+      const r=nodeR(n), lines=wrapText(n.term,18,3);
+      const lw=Math.max(...lines.map(l=>l.length))*FS*0.56+4;
+      return {id:n.id, r, w:Math.max(2*r,lw)+8, h:2*r+11+lines.length*LH};
+    });
+    const xs=nodes.map(n=>pos[n.id]?pos[n.id].x:W/2), ys=nodes.map(n=>pos[n.id]?pos[n.id].y:H/2);
+    const minX=Math.min(...xs), maxX=Math.max(...xs), minY=Math.min(...ys), maxY=Math.max(...ys);
+    const PL=56, PR=56, PT=26, PB=44;
+    const sc=Math.min((W-PL-PR)/Math.max(1,maxX-minX), (H-PT-PB)/Math.max(1,maxY-minY));
+    const ox=PL+((W-PL-PR)-(maxX-minX)*sc)/2, oy=PT+((H-PT-PB)-(maxY-minY)*sc)/2;
+    const P={}; nodes.forEach((n,i)=>{ P[n.id]={x:ox+(xs[i]-minX)*sc, y:oy+(ys[i]-minY)*sc}; });
+    for (let it=0; it<300; it++) {
+      let moved=0;
+      for (let i=0;i<boxes.length;i++) for (let j=i+1;j<boxes.length;j++) {
+        const a=boxes[i], b=boxes[j], pa=P[a.id], pb=P[b.id];
+        const ovx=(a.w+b.w)/2-Math.abs(pa.x-pb.x);
+        const ay0=pa.y-a.r, ay1=ay0+a.h, by0=pb.y-b.r, by1=by0+b.h;
+        const ovy=Math.min(ay1,by1)-Math.max(ay0,by0);
+        if (ovx>0 && ovy>0) {
+          moved++;
+          if (ovx<ovy) { const sg=pa.x<pb.x?-1:1; pa.x+=sg*ovx/2; pb.x-=sg*ovx/2; }
+          else { const sg=(ay0+ay1)<(by0+by1)?-1:1; pa.y+=sg*ovy/2; pb.y-=sg*ovy/2; }
+        }
+      }
+      boxes.forEach(bx=>{ const p=P[bx.id];
+        p.x=Math.max(bx.w/2+4, Math.min(W-bx.w/2-4, p.x));
+        p.y=Math.max(bx.r+4, Math.min(H-(bx.h-bx.r)-4, p.y)); });
+      if (!moved) break;
+    }
+    return P;
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  },[nodes, pos, d.netNodeSizeBy]);
+
   return (
     <div ref={containerRef} style={{position:"relative", display:"inline-block"}}>
     <svg ref={svgRef} width={fullW} height={fullH} viewBox={"0 0 "+fullW+" "+fullH} style={{display:"block", maxWidth:"100%", overflow:"visible"}}
@@ -2422,12 +2490,12 @@ function NetworkGraph({rows, sets, d, svgRef}) {
       {d.plotTitle && <text x={W/2} y={16} textAnchor="middle" fontSize={d.tsz||14} fontWeight={d.tbd?"bold":"normal"} fill={C.text} fontFamily={ff}>{d.plotTitle}</text>}
       <g transform={"translate(0,"+MT+")"}>
         {edges.map((e,i)=>{
-          const a = pos[e.source], b = pos[e.target];
+          const a = placed[e.source], b = placed[e.target];
           if (!a||!b) return null;
           return <line key={i} x1={a.x} y1={a.y} x2={b.x} y2={b.y} stroke="#94A3B8" strokeWidth={0.5+e.weight*3.5} strokeOpacity={0.2+e.weight*0.35}/>;
         })}
         {nodes.map((n,i)=>{
-          const p = pos[n.id]; if (!p) return null;
+          const p = placed[n.id]; if (!p) return null;
           const r = nodeR(n);
           const isHov = hov && hov.node.id===n.id;
           return (
@@ -2438,7 +2506,7 @@ function NetworkGraph({rows, sets, d, svgRef}) {
               <circle cx={p.x} cy={p.y} r={r} fill={colorFor(n)} stroke="#fff" strokeWidth={isHov?2.5:1.5}/>
               {isHov && <circle cx={p.x} cy={p.y} r={r} fill="none" stroke="rgba(0,0,0,0.35)" strokeWidth={1}/>}
               {d.netShowLabels!==false && (() => {
-                const lines = wrapText(n.term, 16, 2);
+                const lines = wrapText(n.term, 18, 3);
                 const ly = p.y+r+11;
                 return (
                   <g>
@@ -2747,19 +2815,7 @@ function encodeTIFF(imageData, dpi) {
 
 // Encode a canvas for download in the requested format, with correct DPI
 // metadata baked in for every raster format.
-function encodeCanvas(canvas, format, dpi) {
-  if (format === "tiff") {
-    const ctx = canvas.getContext("2d");
-    const data = ctx.getImageData(0, 0, canvas.width, canvas.height);
-    return Promise.resolve(new Blob([encodeTIFF(data, dpi)], {type:"image/tiff"}));
-  }
-  const mime = format === "jpeg" ? "image/jpeg" : "image/png";
-  return canvasToBlob(canvas, mime, 0.95).then(blob=>{
-    if (format !== "png") return blob;
-    return blob.arrayBuffer().then(ab=>new Blob([pngWithDPI(ab, dpi)], {type:"image/png"}))
-                             .catch(()=>blob);   // metadata is a bonus, never a blocker
-  });
-}
+/* encodeCanvas: shared/exportUtils (adds JPEG DPI) */
 
 function ExportPanel({svgRef, d, rows, sets, comparisons, plotType}) {
   const C = useC();
@@ -2989,7 +3045,7 @@ function SheetSidebar({sheets, activeId, onSelect, onNew, onRename, onDuplicate,
         <button onClick={onSave} style={{width:"100%", padding:"7px 0", borderRadius:6, fontSize:11, fontWeight:600, cursor:"pointer", background:C.success, border:"none", color:"#fff"}}>Save Project</button>
         <button onClick={()=>fileRef.current&&fileRef.current.click()} style={{width:"100%", padding:"7px 0", borderRadius:6, fontSize:11, cursor:"pointer", background:"transparent", border:"1px solid "+C.border, color:C.muted}}>Load Project</button>
         <input ref={fileRef} type="file" accept=".json" style={{display:"none"}}
-          onChange={e=>{const f=e.target.files[0]; if(!f)return; const r=new FileReader(); r.onload=ev=>{try{onLoad(JSON.parse(ev.target.result));}catch(_){}}; r.readAsText(f); e.target.value="";}}/>
+          onChange={e=>{const f=e.target.files[0]; if(!f)return; const r=new FileReader(); r.onload=ev=>readProjectText(ev.target.result,"pathway-suite",onLoad); r.readAsText(f); e.target.value="";}}/>
         <div style={{fontSize:9, color:C.muted, textAlign:"center"}}>Ctrl+S to save</div>
       </div>
     </div>
@@ -3117,11 +3173,8 @@ export default function PathwaySuitePage() {
   };
 
   const saveProject = () => {
-    const data = JSON.stringify({sheets, activeId}, null, 0);
-    const a=document.createElement("a");
-    a.href="data:application/json;charset=utf-8,"+encodeURIComponent(data);
-    a.download="pathwaysuite_project_"+new Date().toISOString().slice(0,10)+".json";
-    a.click();
+    const data = JSON.stringify({tool:"pathway-suite", sheets, activeId}, null, 0);
+    downloadBlob(new Blob([data],{type:"application/json;charset=utf-8"}), "pathwaysuite_project_"+new Date().toISOString().slice(0,10)+".json"); /* blob download: data: URLs fail silently past ~2MB / in Firefox */
   };
   const loadProject = parsed => {
     if (!parsed || !parsed.sheets || !parsed.sheets.length) return;
@@ -3141,7 +3194,7 @@ export default function PathwaySuitePage() {
   const isNetwork = plotType==="network";
   const TABS = isNetwork
     ? [{id:"terms",label:"Terms"},{id:"plot",label:"Style"},{id:"ora",label:"Enrichment"},{id:"export",label:"Export"}]
-    : [{id:"terms",label:"Terms"},{id:"plot",label:"Style"},{id:"axes",label:"Axes/Frame"},{id:"ora",label:"Enrichment"},{id:"export",label:"Export"}];
+    : [{id:"terms",label:"Terms"},{id:"plot",label:"Style"},{id:"axes",label:"Axes"},{id:"ora",label:"Enrichment"},{id:"export",label:"Export"}];
   const filled = rows.filter(r=>r.term&&r.term.trim()).length;
 
   return (

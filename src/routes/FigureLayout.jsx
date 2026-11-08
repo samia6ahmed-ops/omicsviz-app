@@ -287,14 +287,14 @@ function LabelPanel({labelStyle, setLabelStyle, onRelabelAll}) {
 }
 
 // ─── Canvas (page) settings panel ──────────────────────────────────────────────
-function CanvasPanel({canvas, setCanvas}) {
+function CanvasPanel({canvas, setCanvas, onPreset}) {
   const t=useTheme();
   return (
     <div>
       <SectionLabel>Page Size</SectionLabel>
       <div style={{display:"grid", gridTemplateColumns:"1fr 1fr", gap:5, marginBottom:8}}>
         {PAGE_PRESETS.map(p=>(
-          <button key={p.label} onClick={()=>setCanvas(c=>({...c,widthMM:p.w,heightMM:p.h}))}
+          <button key={p.label} onClick={()=>onPreset ? onPreset(p.w,p.h) : setCanvas(c=>({...c,widthMM:p.w,heightMM:p.h}))}
             style={{padding:"6px 4px", borderRadius:6, cursor:"pointer", textAlign:"center",
               background:(canvas.widthMM===p.w&&canvas.heightMM===p.h)?t.cSel:"transparent", border:"1.5px solid "+((canvas.widthMM===p.w&&canvas.heightMM===p.h)?t.accent:t.border)}}>
             <div style={{fontSize:10, fontWeight:700, color:t.text}}>{p.label}</div>
@@ -358,6 +358,56 @@ function AlignToolbarWired({selectedIds, objects, setObjects}) {
   );
 }
 
+// ─── foreignObject → native SVG text (export only) ─────────────────────────────
+// Text boxes render as HTML inside <foreignObject> so they wrap on screen. Browsers
+// mark a canvas as tainted when it draws an SVG containing foreignObject, so PNG /
+// JPEG / TIFF export failed for any figure with a caption, and many vector editors
+// drop foreignObject from SVGs. At export we re-flow each box into <text>/<tspan>
+// lines using the live element's computed font, so output matches the screen.
+function foreignTextToSVG(liveSvg, clone) {
+  const live = [...liveSvg.querySelectorAll("foreignObject")];
+  const dead = [...clone.querySelectorAll("foreignObject")];
+  const ctx = document.createElement("canvas").getContext("2d");
+  const NS = "http://www.w3.org/2000/svg";
+  dead.forEach((fo, i) => {
+    const lfo = live[i]; const div = lfo && lfo.firstElementChild;
+    if (!div) { fo.remove(); return; }
+    const cs = getComputedStyle(div);
+    const fs = parseFloat(cs.fontSize) || 12;
+    const x = parseFloat(fo.getAttribute("x"))||0, y = parseFloat(fo.getAttribute("y"))||0;
+    const w = parseFloat(fo.getAttribute("width"))||0, h = parseFloat(fo.getAttribute("height"))||0;
+    ctx.font = `${cs.fontStyle} ${cs.fontWeight} ${fs}px ${cs.fontFamily}`;
+    const lines = [];
+    (div.textContent||"").split("\n").forEach(par => {
+      const words = par.split(/\s+/).filter(Boolean); let cur = "";
+      if (!words.length) { lines.push(""); return; }
+      words.forEach(wd => {
+        const tryL = cur ? cur+" "+wd : wd;
+        if (ctx.measureText(tryL).width <= w || !cur) cur = tryL; else { lines.push(cur); cur = wd; }
+      });
+      lines.push(cur);
+    });
+    const lh = fs*1.2, maxLines = Math.max(1, Math.floor(h/lh+0.01));
+    const shown = lines.slice(0, maxLines);
+    const ta = cs.textAlign, jc = cs.justifyContent, ai = cs.alignItems;
+    const anchor = (ta==="center"||(ta!=="right"&&jc==="center")) ? "middle" : (ta==="right"||ta==="end"||jc==="flex-end") ? "end" : "start";
+    const tx = anchor==="middle" ? x+w/2 : anchor==="end" ? x+w : x;
+    const blockH = shown.length*lh;
+    const top = ai==="center" ? y+(h-blockH)/2 : ai==="flex-end" ? y+h-blockH : y;
+    const t = document.createElementNS(NS, "text");
+    t.setAttribute("x", tx); t.setAttribute("text-anchor", anchor);
+    t.setAttribute("font-size", fs); t.setAttribute("font-family", cs.fontFamily);
+    t.setAttribute("font-weight", cs.fontWeight); t.setAttribute("font-style", cs.fontStyle);
+    t.setAttribute("fill", cs.color);
+    shown.forEach((ln, k) => {
+      const sp = document.createElementNS(NS, "tspan");
+      sp.setAttribute("x", tx); sp.setAttribute("y", top + fs*0.95 + k*lh);
+      sp.textContent = ln; t.appendChild(sp);
+    });
+    fo.parentNode.replaceChild(t, fo);
+  });
+}
+
 // ─── Export panel ───────────────────────────────────────────────────────────────
 function ExportPanel({canvasRef, canvas}) {
   const t=useTheme();
@@ -382,6 +432,7 @@ function ExportPanel({canvasRef, canvas}) {
       clone.setAttribute("xmlns","http://www.w3.org/2000/svg");
       // strip selection-only UI (handles, guides) from the export clone
       clone.querySelectorAll("[data-ui-only='true']").forEach(el=>el.remove());
+      foreignTextToSVG(svgEl, clone);
       const svgWpx = mm2px(canvas.widthMM), svgHpx = mm2px(canvas.heightMM);
       if (format==="svg") {
         clone.setAttribute("width", canvas.widthMM+"mm");
@@ -487,29 +538,61 @@ function FigureCanvas({canvas, objects, setObjects, selectedIds, setSelectedIds,
     dragState.current = { mode:"resize", ids:[obj.id], handle, startMM, startObjs:[{id:obj.id,x:obj.x,y:obj.y,w:obj.w,h:obj.h}] };
   },[pointerToMM, setSelectedIds]);
 
+  const [guides,setGuides]=useState([]);   // [{axis:"x"|"y", v:mm}] shown while dragging
+
   const onCanvasPointerMove = useCallback((e) => {
     const ds = dragState.current; if (!ds) return;
     const curMM = pointerToMM(e.clientX, e.clientY);
-    const dx = curMM.x-ds.startMM.x, dy = curMM.y-ds.startMM.y;
+    let dx = curMM.x-ds.startMM.x, dy = curMM.y-ds.startMM.y;
+    if (!ds.moved && Math.hypot(dx,dy) < 0.4) return;      // a click, not a drag
+    const opts = {transient: !!ds.moved}; ds.moved = true;
     if (ds.mode==="move") {
+      const moving = objects.filter(o=>ds.ids.includes(o.id));
+      const starts = ds.startObjs;
+      // group bounding box at the unsnapped position
+      const bx0 = Math.min(...starts.map(s=>s.x))+dx, by0 = Math.min(...starts.map(s=>s.y))+dy;
+      const bx1 = Math.max(...moving.map(o=>{const s=starts.find(q=>q.id===o.id); return s.x+o.w;}))+dx;
+      const by1 = Math.max(...moving.map(o=>{const s=starts.find(q=>q.id===o.id); return s.y+o.h;}))+dy;
+      const g = [];
+      if (canvas.snapToObjects!==false) {
+        const TOL = 2;   // mm
+        const others = objects.filter(o=>!ds.ids.includes(o.id) && o.visible!==false);
+        const xs = [0, canvas.widthMM/2, canvas.widthMM], ys = [0, canvas.heightMM/2, canvas.heightMM];
+        others.forEach(o=>{ xs.push(o.x, o.x+o.w/2, o.x+o.w); ys.push(o.y, o.y+o.h/2, o.y+o.h); });
+        const best = (edges, targets) => {
+          let b = null;
+          edges.forEach(ed=>targets.forEach(tv=>{ const d=tv-ed; if (Math.abs(d)<=TOL && (!b||Math.abs(d)<Math.abs(b.d))) b={d,v:tv}; }));
+          return b;
+        };
+        const sx = best([bx0,(bx0+bx1)/2,bx1], xs), sy = best([by0,(by0+by1)/2,by1], ys);
+        if (sx) { dx += sx.d; g.push({axis:"x", v:sx.v}); }
+        if (sy) { dy += sy.d; g.push({axis:"y", v:sy.v}); }
+      }
+      setGuides(g);
       setObjects(prev=>prev.map(o=>{
         const start = ds.startObjs.find(s=>s.id===o.id);
         if (!start) return o;
         return {...o, x:Math.max(0,Math.min(canvas.widthMM-o.w, start.x+dx)), y:Math.max(0,Math.min(canvas.heightMM-o.h, start.y+dy))};
-      }));
+      }), opts);
     } else if (ds.mode==="resize") {
       const start = ds.startObjs[0];
       setObjects(prev=>prev.map(o=>{
         if (o.id!==start.id) return o;
         const resized = resizeObject({x:start.x,y:start.y,w:start.w,h:start.h}, ds.handle, dx, dy, o.lockAspect!==false);
         return {...o, ...resized};
-      }));
+      }), opts);
     }
-  },[pointerToMM, setObjects, canvas.widthMM, canvas.heightMM]);
+  },[pointerToMM, setObjects, objects, canvas.widthMM, canvas.heightMM, canvas.snapToObjects]);
 
-  const onCanvasPointerUp = useCallback(()=>{ dragState.current=null; },[]);
+  const justDragged = useRef(false);
+  const onCanvasPointerUp = useCallback(()=>{
+    justDragged.current = !!(dragState.current && dragState.current.moved);
+    dragState.current=null; setGuides([]);
+  },[]);
 
-  const onCanvasBackgroundClick = () => setSelectedIds([]);
+  /* a drag/resize that ends off the object fires its click on the page itself;
+     don't treat that as "click empty space → deselect" */
+  const onCanvasBackgroundClick = () => { if (justDragged.current) { justDragged.current=false; return; } setSelectedIds([]); };
 
   const HANDLES = ["tl","t","tr","r","br","b","bl","l"];
   const handlePos = (o, h) => {
@@ -527,6 +610,7 @@ function FigureCanvas({canvas, objects, setObjects, selectedIds, setSelectedIds,
         <svg width={svgW} height={svgH} viewBox={"0 0 "+svgW+" "+svgH}
           style={{display:"block", background:canvas.bg||"#fff", boxShadow:"0 1px 8px rgba(0,0,0,.15)", cursor:"default"}}
           onPointerMove={onCanvasPointerMove} onPointerUp={onCanvasPointerUp} onPointerLeave={onCanvasPointerUp}
+          onPointerDown={()=>{justDragged.current=false;}}
           onClick={onCanvasBackgroundClick}>
           {canvas.showMargin && (
             <rect data-ui-only="true" x={mm2px(canvas.marginMM)} y={mm2px(canvas.marginMM)}
@@ -538,7 +622,9 @@ function FigureCanvas({canvas, objects, setObjects, selectedIds, setSelectedIds,
             const isSel = selectedIds.includes(o.id);
             const px = mm2px(o.x), py = mm2px(o.y), pw = mm2px(o.w), ph = mm2px(o.h);
             return (
-              <g key={o.id}>
+              /* stop the click reaching the page background, whose onClick clears the
+                 selection — otherwise clicking a panel selected and instantly deselected it */
+              <g key={o.id} onClick={e=>e.stopPropagation()}>
                 <g onPointerDown={e=>onObjectPointerDown(e,o)} style={{cursor:"move"}}>
                   {o.type==="image" && o.data.kind==="svg" && (
                     <svg x={px} y={py} width={pw} height={ph} viewBox={o.data.viewBox} preserveAspectRatio="xMidYMid meet"
@@ -551,7 +637,7 @@ function FigureCanvas({canvas, objects, setObjects, selectedIds, setSelectedIds,
                     <foreignObject x={px} y={py} width={pw} height={ph}>
                       <div style={{width:"100%", height:"100%", display:"flex", alignItems:o.vAlign||"flex-start", justifyContent:o.hAlign||"flex-start",
                         fontSize:(o.fontSize||11)*MM_TO_PX/2.83, fontWeight:o.bold?"bold":"normal", fontStyle:o.italic?"italic":"normal",
-                        color:o.color||t.text, fontFamily:o.ff||"Inter", textAlign:o.textAlign||"left", overflow:"hidden", wordBreak:"break-word"}}>
+                        color:o.color||t.text, fontFamily:o.ff||"Inter", textAlign:o.textAlign||"left", overflow:"hidden", wordBreak:"break-word", whiteSpace:"pre-wrap"}}>
                         {o.text||"Click to edit text"}
                       </div>
                     </foreignObject>
@@ -583,6 +669,9 @@ function FigureCanvas({canvas, objects, setObjects, selectedIds, setSelectedIds,
               </g>
             );
           })}
+          {guides.map((gd,i)=> gd.axis==="x"
+            ? <line key={"g"+i} data-ui-only="true" x1={mm2px(gd.v)} x2={mm2px(gd.v)} y1={0} y2={svgH} stroke="#EC4899" strokeWidth={1} strokeDasharray="4 3" pointerEvents="none"/>
+            : <line key={"g"+i} data-ui-only="true" y1={mm2px(gd.v)} y2={mm2px(gd.v)} x1={0} x2={svgW} stroke="#EC4899" strokeWidth={1} strokeDasharray="4 3" pointerEvents="none"/>)}
         </svg>
       </div>
     </div>
@@ -604,10 +693,18 @@ export default function FigureLayoutPage() {
   const objectsCursor = useRef(0);
   const [objects,setObjectsRaw]=useState([]);
   const [,bump]=useState(0);
-  const setObjects = useCallback(fn=>{
+  /* opts.transient: replace the current history entry instead of pushing a new
+     one. Drags and typing call setObjects on every pointermove / keystroke; pushing
+     each one meant a single drag filled the 30-step history, so Undo only nudged the
+     panel back a pixel and everything before the drag was lost. */
+  const setObjects = useCallback((fn, opts)=>{
     const prev = objectsHistory.current[objectsCursor.current];
     const next = typeof fn==="function" ? fn(prev) : fn;
-    objectsHistory.current = [...objectsHistory.current.slice(0,objectsCursor.current+1), next].slice(-30);
+    if (opts && opts.transient) {
+      objectsHistory.current = [...objectsHistory.current.slice(0,objectsCursor.current), next];
+    } else {
+      objectsHistory.current = [...objectsHistory.current.slice(0,objectsCursor.current+1), next].slice(-30);
+    }
     objectsCursor.current = objectsHistory.current.length-1;
     setObjectsRaw(next); bump(v=>v+1);
   },[]);
@@ -616,41 +713,75 @@ export default function FigureLayoutPage() {
   const canUndo = objectsCursor.current>0, canRedo = objectsCursor.current<objectsHistory.current.length-1;
 
   const [selectedIds,setSelectedIds]=useState([]);
+  const lastTextEdit = useRef(null);
 
   const nextZ = () => (objects.length ? Math.max(...objects.map(o=>o.zIndex)) : 0) + 1;
   const nextPanelLabelIndex = () => objects.filter(o=>o.type==="image").length;
 
   const onFilesAdded = async (fileList) => {
     const files = Array.from(fileList);
-    let cascade = objects.length;
     for (const file of files) {
       try {
         const isSvg = file.type==="image/svg+xml" || file.name.toLowerCase().endsWith(".svg");
         const data = isSvg ? await readSvgFile(file) : await readRasterFile(file);
         const aspect = data.naturalW/data.naturalH || 1.5;
-        const targetW = Math.min(80, canvas.widthMM*0.45);
-        const targetH = targetW/aspect;
-        const offset = (cascade%5)*8;
-        const idx = nextPanelLabelIndex();
-        setObjects(prev=>[...prev, {
-          id: Date.now()+Math.random(), type:"image", name:file.name,
-          x: 10+offset, y: 10+offset, w: targetW, h: targetH,
-          lockAspect: true, zIndex: nextZ()+cascade, visible:true,
-          showLabel:true, label: nextLabel(idx),
-          data,
-        }]);
-        cascade++;
+        /* Read label index, z-order and position from the latest state (prev), not the
+           render-time `objects`, so several files dropped at once get A, B, C, D and tile
+           into a two-column grid instead of all becoming "A" in a pile. */
+        setObjects(prev=>{
+          const imgs = prev.filter(o=>o.type==="image");
+          const idx = imgs.length;
+          const gap = 6;
+          const cellW = (canvas.widthMM - gap*3)/2;
+          const w = Math.min(cellW, canvas.widthMM*0.48), h = w/aspect;
+          const col = idx%2;
+          let x = gap + col*(cellW+gap), y;
+          if (col===1 && imgs.length) y = imgs[imgs.length-1].y;
+          else y = imgs.length ? Math.max(...imgs.map(o=>o.y+o.h)) + gap : gap;
+          if (y + h > canvas.heightMM) { const off=(idx%5)*8; x = 10+off; y = 10+off; }
+          const z = (prev.length ? Math.max(...prev.map(o=>o.zIndex)) : 0) + 1;
+          return [...prev, {
+            id: Date.now()+Math.random(), type:"image", name:file.name,
+            x, y, w, h, lockAspect: true, zIndex: z, visible:true,
+            showLabel:true, label: nextLabel(idx), data,
+          }];
+        });
       } catch(err) { console.error("Failed to load", file.name, err); }
     }
   };
 
+  /* Switching to a smaller page preset used to leave panels hanging off the page
+     (invisible, and silently cropped from the export). Shrink the whole layout
+     uniformly so everything still fits; never enlarge it. */
+  const applyPagePreset = (wMM, hMM) => {
+    setCanvas(c=>({...c, widthMM:wMM, heightMM:hMM}));
+    setObjects(prev=>{
+      const vis = prev.filter(o=>o.visible!==false);
+      if (!vis.length) return prev;
+      const right = Math.max(...vis.map(o=>o.x+o.w)), bottom = Math.max(...vis.map(o=>o.y+o.h));
+      const pad = 4;
+      const sc = Math.min(1, (wMM-pad)/right, (hMM-pad)/bottom);
+      if (sc >= 0.999) return prev;
+      return prev.map(o=>({...o, x:o.x*sc, y:o.y*sc, w:o.w*sc, h:o.h*sc}));
+    });
+  };
+
   const onAddText = () => {
-    setObjects(prev=>[...prev, {
-      id: Date.now()+Math.random(), type:"text", text:"Figure 1. ", 
-      x: 10, y: canvas.heightMM-30, w: canvas.widthMM-20, h: 20,
+    /* select the new box so the "Edit Text" field appears straight away */
+    const id = Date.now()+Math.random();
+    setSelectedIds([id]);
+    setObjects(prev=>{
+      /* place the caption just under the lowest panel (it used to land 30 mm from
+         the page bottom, usually scrolled out of view) */
+      const vis = prev.filter(o=>o.visible!==false);
+      const below = vis.length ? Math.max(...vis.map(o=>o.y+o.h)) + 4 : 10;
+      const h = 22, y = Math.min(below, canvas.heightMM-h-4);
+      return [...prev, {
+      id, type:"text", text:"Figure 1. ",
+      x: 6, y, w: canvas.widthMM-12, h,
       fontSize:10, bold:false, italic:false, color:"#1E2736", ff:"Inter", textAlign:"left", hAlign:"flex-start", vAlign:"flex-start",
-      zIndex: nextZ(), visible:true,
-    }]);
+      zIndex: (prev.length ? Math.max(...prev.map(o=>o.zIndex)) : 0) + 1, visible:true,
+    }]; });
   };
 
   const onReorder = (id, dir) => setObjects(prev=>{
@@ -660,7 +791,7 @@ export default function FigureLayoutPage() {
   const onDelete = (id) => { setObjects(prev=>prev.filter(o=>o.id!==id)); setSelectedIds(prev=>prev.filter(i=>i!==id)); };
   const onDuplicate = (id) => setObjects(prev=>{
     const src = prev.find(o=>o.id===id); if (!src) return prev;
-    return [...prev, {...src, id:Date.now()+Math.random(), x:src.x+6, y:src.y+6, zIndex:nextZ()}];
+    return [...prev, {...src, id:Date.now()+Math.random(), x:src.x+6, y:src.y+6, zIndex:Math.max(...prev.map(o=>o.zIndex))+1}];
   });
   const onToggleVisible = (id) => setObjects(prev=>prev.map(o=>o.id===id?{...o,visible:o.visible===false}:o));
 
@@ -723,14 +854,16 @@ export default function FigureLayoutPage() {
               {rightTab==="insert"&&<InsertPanel onFilesAdded={onFilesAdded} onAddText={onAddText}/>}
               {rightTab==="layers"&&<LayersPanel objects={objects} selectedIds={selectedIds} setSelectedIds={setSelectedIds} onReorder={onReorder} onDelete={onDelete} onDuplicate={onDuplicate} onToggleVisible={onToggleVisible}/>}
               {rightTab==="label"&&<LabelPanel labelStyle={labelStyle} setLabelStyle={setLabelStyle} onRelabelAll={onRelabelAll}/>}
-              {rightTab==="canvas"&&<CanvasPanel canvas={canvas} setCanvas={setCanvas}/>}
+              {rightTab==="canvas"&&<CanvasPanel canvas={canvas} setCanvas={setCanvas} onPreset={applyPagePreset}/>}
               {rightTab==="export"&&<ExportPanel canvasRef={canvasWrapRef} canvas={canvas}/>}
             </div>
             {selectedObjects.length===1 && selectedObjects[0].type==="text" && (
               <div style={{padding:"10px 12px", borderTop:"1px solid "+activeTheme.border, background:activeTheme.panel2}}>
                 <SectionLabel>Edit Text</SectionLabel>
                 <textarea value={selectedObjects[0].text} rows={3}
-                  onChange={e=>setObjects(prev=>prev.map(o=>o.id===selectedObjects[0].id?{...o,text:e.target.value}:o))}
+                  onChange={e=>{ const id=selectedObjects[0].id; const same=lastTextEdit.current===id; lastTextEdit.current=id;
+                    setObjects(prev=>prev.map(o=>o.id===id?{...o,text:e.target.value}:o), {transient:same}); }}
+                  onBlur={()=>{lastTextEdit.current=null;}}
                   style={{width:"100%", boxSizing:"border-box", padding:"6px 8px", fontSize:11, borderRadius:6, border:"1px solid "+activeTheme.border, background:activeTheme.cBg, color:activeTheme.text, outline:"none", resize:"vertical"}}/>
               </div>
             )}
