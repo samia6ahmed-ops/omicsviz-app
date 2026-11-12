@@ -1,5 +1,6 @@
 import { lazy, Suspense } from "react";
 import { BrowserRouter, Routes, Route, Navigate, Link } from "react-router-dom";
+import { Analytics } from "@vercel/analytics/react";
 import { AuthProvider } from "./shared/AuthContext";
 import AppShell from "./shared/AppShell";
 import About from "./routes/About";
@@ -77,6 +78,7 @@ export default function App() {
             <Route path="*" element={<NotFound />} />
           </Route>
         </Routes>
+        <Analytics />
       </BrowserRouter>
     </AuthProvider>
   );
